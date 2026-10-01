@@ -280,3 +280,26 @@ npm run test:mobile          # 触屏控件（虚拟摇杆 / 油门 / 按钮边�
 [SimplePlanes 2 on Steam](https://store.steampowered.com/app/2840470/SimplePlanes_2/)、
 [SimplePlanes 官网](https://www.simpleplanes.com/)、
 [原版地点考据帖](https://www.simpleplanes.com/Forums/View/1712834)。
+
+---
+
+## 许可证
+
+**GNU Affero 通用公共许可证第 3 版或任何更新版本（AGPL-3.0-or-later）**
+
+Copyright (C) 2026 Hotsteel2901
+
+本程序是自由软件：你可以按自由软件基金会发布的 GNU Affero 通用公共许可证
+（第 3 版或你选择的任何更新版本）的条款重新发布和/或修改它。
+本程序不提供任何担保，甚至不提供适销性或特定用途适用性的默示担保。
+
+- 许可证全文：[`LICENSE`](./LICENSE)（AGPL-3.0 逐字副本）
+- 版权、第三方组件与商标声明：[`NOTICE.md`](./NOTICE.md)
+- SPDX 标识：`AGPL-3.0-or-later`
+
+**关于网络服务（AGPL 第 13 条）**：本作品是可经网络交互的网页应用。
+如果你修改后把它作为网络服务提供给他人使用，你必须在适当位置向使用者提供获取其源代码的方式。
+作品的界面（主菜单）里已内置指向本仓库的「源代码」链接。
+
+第三方组件：`vendor/` 下的 three.js 构建产物版权归 three.js authors，以 **MIT** 许可证分发
+（与 AGPL 兼容，其自身条款不变）。

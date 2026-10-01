@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Hotsteel2901
 /**
  * SimplePlanes 2 (three.js 复刻) —— 主程序
  * ------------------------------------------------------------------

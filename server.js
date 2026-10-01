@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (C) 2026 Hotsteel2901
 /**
  * 极简静态服务器（零依赖）+ WebSocket 联机端点（/ws）
  * 用法：node server.js [port]

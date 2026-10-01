@@ -9,6 +9,9 @@ import { stockCrafts } from '../build/crafts.js';
 import { audio } from '../audio/audio.js';
 import { fmt, fmtTime, formatMoney, clamp } from '../core/util.js';
 
+/** 源代码仓库地址（AGPL 第 13 条要求向网络使用者提供） */
+export const SOURCE_URL = 'https://github.com/Hotsteel2901/SimpleP_Web_DS';
+
 const EXTRA_CSS = `
 .sp2-card--action .sp2-card__icon { font-size: 20px; margin-right: 8px; }
 .sp2-card--action .sp2-card__text { display: block; }
@@ -153,6 +156,15 @@ export class UI {
 
     this.inner.appendChild(el('p', { class: 'sp2-hint', text: '提示：鼠标瞄准模式下，把光标拖离中心即可操纵飞机；机库中可随时改装。' }));
     this.inner.appendChild(el('p', { class: 'sp2-hint', style: { opacity: '.6' }, text: '这是一个用 three.js 从零复刻的粉丝作品：全部地形、模型、音乐与音效均为程序化生成，无任何外部资源。' }));
+    // AGPL 第 13 条：网络交互作品必须让使用者能找到源代码
+    this.inner.appendChild(el('p', { class: 'sp2-hint', style: { display: 'flex', gap: '14px', flexWrap: 'wrap', alignItems: 'center' } }, [
+      el('a', {
+        href: SOURCE_URL, target: '_blank', rel: 'noopener',
+        style: { color: '#8fdfff', textDecoration: 'underline', pointerEvents: 'auto' },
+        text: '源代码（AGPL-3.0-or-later）',
+      }),
+      el('span', { text: 'Copyright (C) 2026 Hotsteel2901 · 本程序不提供任何担保' }),
+    ]));
   }
 
   /* ------------------------------------------------------------ 地图选择 */

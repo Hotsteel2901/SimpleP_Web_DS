@@ -9,6 +9,9 @@ Thumbs.db
 *.swp
 *~
 
+# Agent 会话导出（本机产物，不进仓库）
+dsh-tui-export-*.md
+
 # 编辑器
 .vscode/
 .idea/

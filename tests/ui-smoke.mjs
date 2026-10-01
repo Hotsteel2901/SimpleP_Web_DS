@@ -44,6 +44,12 @@ const fakeApp = {
 const ui = new UI(fakeApp);
 ok('UI 构造', () => { if (!ui.root) throw new Error('无 root'); });
 ok('主菜单', () => ui.mainMenu());
+ok('主菜单含 AGPL 源代码链接', () => {
+  const a = document.querySelector('.sp2-menu a[href*="github.com"]');
+  if (!a) throw new Error('未找到源代码链接（AGPL 第 13 条要求）');
+  if (!/SimpleP_Web_DS/.test(a.href)) throw new Error('链接地址不对: ' + a.href);
+  if (a.target !== '_blank') throw new Error('应在新标签打开');
+});
 ok('地图选择', () => ui.mapSelect());
 ok('任务选择', () => ui.missionSelect());
 ok('载具库', () => ui.craftLibrary());
