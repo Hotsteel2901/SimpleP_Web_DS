@@ -14,9 +14,9 @@ Thumbs.db
 .idea/
 *.code-workspace
 
-# 运行时产物
-dist/
-build/
-coverage/
-.cache/
+# 运行时产物（只忽略仓库根目录下的，避免误伤 src/build/）
+/dist/
+/build/
+/coverage/
+/.cache/
 *.tsbuildinfo
