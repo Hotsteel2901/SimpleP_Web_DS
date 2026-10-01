@@ -9,6 +9,7 @@
 import * as THREE from 'three';
 import { Emitter, clamp, clamp01, lerp } from '../core/util.js';
 import { NetClient, PeerManager, defaultServerUrl, DEFAULT_ICE } from './net.js';
+import { vibeHubAvailable, createVibeTransport } from './vibehub.js';
 import { Aircraft } from '../flight/aircraft.js';
 
 const _v = new THREE.Vector3(), _v2 = new THREE.Vector3();
@@ -30,8 +31,19 @@ export class MultiplayerSession extends Emitter {
     this.game = game;
     this.opts = opts;
     this.playerName = opts.playerName || 'Pilot';
-    this.net = new NetClient(opts.serverUrl || defaultServerUrl());
-    if (opts.iceServers?.length) this.net.setIceServers(opts.iceServers);
+    // 平台内优先使用官方 VibeHub SDK（规范禁止自建后端/WebSocket）；
+    // 自建服务器或本地开发时回退到 WebSocket 实现。
+    this.work = opts.work || 'simpleplanes2';
+    this.useVibeHub = (opts.preferVibeHub !== false) && vibeHubAvailable();
+    if (this.useVibeHub) {
+      const t = createVibeTransport({ work: this.work, name: this.playerName });
+      this.net = t.net;
+      this._vibePeers = t.peers;
+    } else {
+      this.net = new NetClient(opts.serverUrl || defaultServerUrl());
+      if (opts.iceServers?.length) this.net.setIceServers(opts.iceServers);
+      this._vibePeers = null;
+    }
     this.peers = null;
     this.room = null;
     this.self = null;
@@ -55,8 +67,15 @@ export class MultiplayerSession extends Emitter {
   get isHost() { return !!this.self?.isHost; }
   get playerCount() { return this.players.size + (this.self ? 1 : 0); }
 
+  /** 统一的 PeerManager 获取（VibeHub 模式下用 SDK Room 的定向发送） */
+  _ensurePeerManager() {
+    if (this.peers) return this.peers;
+    this.peers = this._vibePeers || new PeerManager(this.net, this.self?.id || 'me');
+    return this.peers;
+  }
+
   async connect(url) {
-    if (url) this.net.url = url;
+    if (url && this.net.url !== undefined) this.net.url = url;
     this.status = 'connecting';
     this.emit('status', this.status);
     try {
@@ -145,7 +164,7 @@ export class MultiplayerSession extends Emitter {
         if (p.id === this.self.id) continue;
         this.players.set(p.id, { ...p, buffer: [], ac: null });
       }
-      this.peers = this.peers || new PeerManager(net, this.self.id);
+      this._ensurePeerManager();
       this.status = 'playing';
       this.emit('status', this.status);
       this.emit('room', this.room);
@@ -188,7 +207,7 @@ export class MultiplayerSession extends Emitter {
   }
 
   _ensurePeer(id) {
-    if (!this.peers) this.peers = new PeerManager(this.net, this.self.id);
+    this._ensurePeerManager();
     const link = this.peers.ensure(id);
     link.on('data', (d) => this._onPeerData(id, d));
     return link;
@@ -285,6 +304,7 @@ export class MultiplayerSession extends Emitter {
   /* ------------------------------------------------------------ 主循环 */
   update(dt) {
     if (this.status !== 'playing') return;
+    this.net.update?.();
     // 发送本地状态
     this._sendAccum += dt;
     const interval = 1 / clamp(this.tickRate, 5, 60);

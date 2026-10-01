@@ -14,6 +14,10 @@ import { computeCraftStats } from './flight/aircraft.js';
 import { getMap, GAME_MODES } from './world/maps.js';
 import { Toast } from './ui/widgets.js';
 import { MultiplayerSession } from './net/mp.js';
+import { vibeHubAvailable } from './net/vibehub.js';
+
+/** 项目 slug（与 vibehub list / SDK init work / --slug 一致） */
+const VIBEHUB_WORK = 'simpleplanes2';
 import { clamp, fmt, store } from './core/util.js';
 
 /** HUD / Builder 采用动态导入，缺失时游戏仍可运行 */
@@ -92,11 +96,52 @@ class App {
     window.addEventListener('pointerdown', unlock);
     window.addEventListener('keydown', unlock);
 
+    await this.initVibeHub();
     await this.loadStockCrafts();
     this.ui.loadingDone();
     this.setState('menu');
     this.ui.mainMenu();
     this.loop();
+  }
+
+  /**
+   * 初始化 VibeHub SDK（平台内必须使用 window.VibeHub）。
+   * 云存档：把本地档案同步到 vibe.save，换设备也能接着玩。
+   * 不可用时（本地开发/自建服务器）静默跳过，不影响单机。
+   */
+  async initVibeHub() {
+    if (!vibeHubAvailable()) return null;
+    try {
+      const client = await window.VibeHub.init({ work: VIBEHUB_WORK });
+      this.vibe = client;
+      try {
+        const cloud = await client.save.get('profile');
+        if (cloud && typeof cloud === 'object' && (cloud.money != null || cloud.stats)) {
+          // 云端档案优先（仅合并关键字段，避免覆盖本地更完整的结构）
+          this.save.profile = { ...this.save.profile, ...cloud, settings: { ...this.save.profile.settings, ...(cloud.settings || {}) } };
+          this.save.save();
+        } else {
+          await client.save.set('profile', this.save.profile);
+        }
+      } catch (e) { /* 云存档失败不影响游戏 */ }
+      const u = client.user;
+      if (u?.name) { this.save.profile.name = u.name; this.save.save(); }
+      return client;
+    } catch (e) {
+      console.warn('[vibehub] SDK 初始化失败（将以单机模式运行）:', e?.message || e);
+      return null;
+    }
+  }
+
+  /** 存档同时写云端（节流，失败静默） */
+  syncCloudProfile() {
+    if (!this.vibe || this._cloudSyncBusy) return;
+    const now = Date.now();
+    if (now - (this._cloudSyncAt || 0) < 5000) return;
+    this._cloudSyncAt = now; this._cloudSyncBusy = true;
+    this.vibe.save.set('profile', this.save.profile)
+      .catch(() => { })
+      .finally(() => { this._cloudSyncBusy = false; });
   }
 
   async loadStockCrafts() {
@@ -303,6 +348,7 @@ class App {
     save.profile.stats.flights++;
     if (mission.mode === 'race' && mission.success) save.profile.stats.racesWon++;
     save.save();
+    this.syncCloudProfile();   // 平台内同步到 vibe.save
     try { audio.playMusic(mission.success ? 'victory' : 'failure'); } catch { }
     setTimeout(() => {
       this.game.paused = true;
@@ -398,6 +444,7 @@ class App {
   ensureMP() {
     if (this.mp) return this.mp;
     this.mp = new MultiplayerSession(this.game, {
+      work: VIBEHUB_WORK,
       playerName: this.save.profile.name || 'Pilot',
       serverUrl: this.save.settings.serverUrl || undefined,
       iceServers: this.save.settings.turnUrl
