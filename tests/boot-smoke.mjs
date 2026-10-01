@@ -177,5 +177,80 @@ try {
   fails++; console.log('❌ 界面层级', e.message); console.log(String(e.stack).split('\n').slice(1, 4).join('\n'));
 }
 
+// ---------------------------------------------------------------------------
+// 回归：飞行中「暂停 → 设置」不能被任何自愈逻辑关掉（否则表现为卡死）
+// ---------------------------------------------------------------------------
+try {
+  await app.startFlight(app.allCrafts()[0].id, 'archipelago', { mode: 'free' });
+  await new Promise((r) => setTimeout(r, 120));
+  app.pauseGame();
+  await new Promise((r) => setTimeout(r, 120));
+  ok('暂停后进入暂停菜单', () => {
+    if (!app.game.paused) throw new Error('未暂停');
+    if (app.ui.screen !== 'pause') throw new Error('screen=' + app.ui.screen);
+  });
+
+  // 从暂停菜单点「设置」
+  app.ui.settings();
+  await new Promise((r) => setTimeout(r, 250));   // 多跑几帧，触发自愈逻辑
+  ok('★ 飞行中进入设置：界面仍然可见（这次卡死的核心）', () => {
+    if (app.ui.screen !== 'settings') throw new Error('screen 被改成 ' + app.ui.screen);
+    if (!app.ui.visible) throw new Error('设置界面被自动关掉了');
+    const menu = document.querySelector('.sp2-menu');
+    if (!menu || window.getComputedStyle(menu).display === 'none') throw new Error('菜单 display=none');
+  });
+  ok('设置界面里的控件已渲染', () => {
+    const n = document.querySelectorAll('.sp2-menu .sp-slider, .sp2-menu .sp-toggle, .sp2-menu .sp-select').length;
+    if (n < 5) throw new Error('控件数量 ' + n);
+  });
+  ok('游戏仍处于暂停（不会被设置界面意外恢复）', () => { if (!app.game.paused) throw new Error('被恢复了'); });
+
+  // 点击「返回」应回到暂停菜单
+  let backBtn = null;
+  for (const b of document.querySelectorAll('.sp2-menu button')) {
+    if (/返回/.test(b.textContent || '')) backBtn = b;
+  }
+  ok('设置界面有返回按钮', () => { if (!backBtn) throw new Error('没找到返回按钮'); });
+  if (backBtn) backBtn.click();
+  await new Promise((r) => setTimeout(r, 200));
+  ok('返回后回到暂停菜单而不是卡住', () => {
+    if (app.ui.screen !== 'pause') throw new Error('screen=' + app.ui.screen);
+    if (!app.ui.visible) throw new Error('暂停菜单不可见');
+  });
+
+  // Esc 在设置界面应退回暂停菜单
+  app.ui.settings();
+  await new Promise((r) => setTimeout(r, 150));
+  window.dispatchEvent(new window.KeyboardEvent('keydown', { code: 'Escape' }));
+  await new Promise((r) => setTimeout(r, 150));
+  ok('设置界面按 Esc 退回暂停菜单', () => { if (app.ui.screen !== 'pause') throw new Error('screen=' + app.ui.screen); });
+
+  // 恢复飞行
+  app.resumeGame();
+  await new Promise((r) => setTimeout(r, 200));
+  ok('恢复后回到飞行且菜单关闭', () => {
+    if (app.game.paused) throw new Error('仍在暂停');
+    if (app.ui.visible) throw new Error('菜单没有关闭');
+    if (app.state !== 'flight') throw new Error('state=' + app.state);
+  });
+  // 计时器：连续暂停/进设置/返回/恢复 10 轮，不应出现任何异常或卡住
+  let rounds = 0;
+  for (let i = 0; i < 10; i++) {
+    app.pauseGame(); app.ui.settings();
+    await new Promise((r) => setTimeout(r, 20));
+    if (app.ui.screen === 'settings' && app.ui.visible) rounds++;
+    app.ui.pause(app.game);
+    await new Promise((r) => setTimeout(r, 20));
+    app.resumeGame();
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  ok('连续 10 轮「暂停→设置→返回→恢复」都正常', () => {
+    if (rounds !== 10) throw new Error(`只有 ${rounds}/10 轮设置界面正常显示`);
+    if (app.game.paused) throw new Error('最后一轮没有恢复');
+  });
+} catch (e) {
+  fails++; console.log('❌ 暂停/设置流程', e.message); console.log(String(e.stack).split('\n').slice(1, 4).join('\n'));
+}
+
 console.log(fails ? `\n❌ ${fails} 项失败` : '\n✅ 启动流程通过');
 process.exit(fails ? 1 : 0);

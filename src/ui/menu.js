@@ -99,6 +99,7 @@ export class UI {
   }
 
   hide() { this.root.style.display = 'none'; this.screen = null; this._hidden = true; }
+  get currentScreen() { return this.screen; }
   get visible() { return this.root.style.display !== 'none'; }
   isVisible() { return this.visible; }
   show(name) {

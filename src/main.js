@@ -172,11 +172,9 @@ class App {
   _syncOverlays() {
     const st = this.state;
     const wantMenu = (st === 'menu' || st === 'loading');
-    // 菜单
-    if (this.ui) {
-      if (!wantMenu) this.ui.hide();
-      else if (!this.ui.visible && this.ui.screen !== 'pause' && this.ui.screen !== 'result') { /* 由各界面自己 show */ }
-    }
+    const pausedScreen = !!(this.ui && (this.ui.screen === 'pause' || this.ui.screen === 'settings' || this.ui.screen === 'result'));
+    // 菜单：暂停流程中的界面（暂停/设置/结算）不受状态同步影响
+    if (this.ui && !wantMenu && !pausedScreen) this.ui.hide();
     // 建造器：只在离开建造器状态时关闭（打开由 openBuilder 自己负责，避免重复 open）
     if (this.builder && st !== 'builder' && this.builder._open && !this._builderKeepOpen) {
       this.builder.close();
@@ -207,6 +205,7 @@ class App {
     this.input.on('keydown', (e) => {
       if (e.code === 'Escape') {
         if (this.state === 'flight') {
+          if (this.ui.screen === 'settings') { this.ui.pause(this.game); return; }  // 设置 → 退回暂停菜单
           if (this.game.paused) { this.resumeGame(); } else { this.pauseGame(); }
         }
       }
@@ -614,8 +613,10 @@ class App {
 
     try {
       if (this.state === 'flight') {
-        // 保险：任何路径漏关菜单都能自愈（但不要关掉暂停/结算界面）
-        if (this.ui.visible && this.ui.screen !== 'pause' && this.ui.screen !== 'result') this.ui.hide();
+        // 保险：任何路径漏关菜单都能自愈。
+        // 注意：暂停流程（暂停菜单/设置/结算）必须整体豁免，否则玩家一进设置界面，
+        // 菜单被自动关掉、触屏控件也已隐藏，就会表现为「卡死」。
+        if (this.ui.visible && !this.game.paused) this.ui.hide();
         const axes = this.input.update(dt, { aimAssist: true });
         // 触屏/手柄的边沿动作（移动端没有键盘，必须在这里处理）
         const ed = this.input.edges || {};
