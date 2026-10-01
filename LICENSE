@@ -1,0 +1,37 @@
+MIT License
+
+Copyright (c) 2026 Hotsteel2901
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+---
+
+Third-party notices
+-------------------
+
+This project depends on three.js (https://threejs.org/), Copyright © 2010-2026
+three.js authors, distributed under the MIT License. A copy of the three.js
+build is vendored under `vendor/` so the game can run without a bundler; it
+remains under its own MIT license.
+
+SimplePlanes and SimplePlanes 2 are trademarks of Jundroo, LLC. This is an
+unofficial fan-made reimplementation created for learning and demonstration
+purposes. It is not affiliated with or endorsed by Jundroo, and it contains no
+assets from the original games: every mesh, texture, sound and piece of music
+in this repository is generated procedurally at runtime by the code in `src/`.

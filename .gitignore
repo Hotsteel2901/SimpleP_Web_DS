@@ -1,0 +1,22 @@
+# 依赖（用 npm install 还原）
+node_modules/
+
+# 日志与临时文件
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# 编辑器
+.vscode/
+.idea/
+*.code-workspace
+
+# 运行时产物
+dist/
+build/
+coverage/
+.cache/
+*.tsbuildinfo

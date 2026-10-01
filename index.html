@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="theme-color" content="#05080d" />
+<title>SimplePlanes 2 · three.js 复刻版</title>
+<meta name="description" content="用 three.js 从零复刻的《简单飞机 2》：程序化建造、飞行物理、9 张地图、竞速/空战/货运/降落等玩法，音乐音效全部实时合成。" />
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #05080d; }
+  html { -webkit-text-size-adjust: 100%; }
+  body { font-family: system-ui, -apple-system, "Segoe UI", "Noto Sans SC", sans-serif; color: #dbe9f4;
+    /* 允许在菜单/面板内纵向滚动与拖动滑块，但禁止双击缩放与页面回弹 */
+    touch-action: manipulation; overscroll-behavior: none; -webkit-user-select: none; user-select: none;
+    -webkit-tap-highlight-color: transparent; }
+  #gl { position: fixed; inset: 0; width: 100vw; height: 100%; display: block; touch-action: none; }
+  #hud { position: fixed; inset: 0; pointer-events: none; z-index: 20; }
+  #hud canvas { pointer-events: none; }
+  #ui { position: fixed; inset: 0; z-index: 30; pointer-events: none; }
+  #ui > * { pointer-events: auto; }
+
+  /* 启动画面 */
+  #boot { position: fixed; inset: 0; z-index: 90; display: flex; align-items: center; justify-content: center;
+    background: radial-gradient(120% 100% at 50% 0%, #0d2136 0%, #05080d 70%); transition: opacity .6s ease; }
+  #boot.hide { opacity: 0; pointer-events: none; }
+  #boot .box { text-align: center; max-width: 560px; padding: 24px; }
+  #boot h1 { font-size: clamp(26px, 6vw, 48px); margin: 0 0 6px; letter-spacing: .08em;
+    text-shadow: 0 0 30px rgba(0,208,255,.55); }
+  #boot p { color: #8fb6cc; line-height: 1.7; font-size: 14px; }
+  #boot .key { display: inline-block; padding: 1px 7px; border: 1px solid rgba(0,208,255,.4); border-radius: 5px; color: #9fe6ff; font-size: 12px; }
+  .spin { width: 54px; height: 54px; margin: 18px auto 4px; border-radius: 50%;
+    border: 3px solid rgba(0,208,255,.18); border-top-color: #00d0ff; animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #fatal { position: fixed; inset: 0; z-index: 200; display: none; align-items: center; justify-content: center; background: #05080d; padding: 24px; }
+  #fatal .box { max-width: 720px; }
+  #fatal h2 { color: #ff4d5e; }
+  #fatal pre { white-space: pre-wrap; color: #9bb6c8; font-size: 12px; background: #0b1119; padding: 12px; border-radius: 8px; overflow: auto; max-height: 40vh; }
+  noscript { color: #ff9f43; }
+</style>
+</head>
+<body>
+  <canvas id="gl"></canvas>
+  <div id="hud"></div>
+  <div id="ui"></div>
+
+  <div id="boot">
+    <div class="box">
+      <h1>SIMPLEPLANES 2</h1>
+      <p>three.js 复刻版 · 建造 · 飞行 · 探索</p>
+      <div class="spin"></div>
+      <p id="bootStatus">正在加载 three.js…</p>
+      <p style="font-size:12px;opacity:.75">
+        点击或按任意键开启声音。使用 <span class="key">鼠标</span> 瞄准飞行，
+        <span class="key">W</span><span class="key">S</span> 俯仰，<span class="key">A</span><span class="key">D</span> 滚转，
+        <span class="key">Shift</span> 加油门，<span class="key">F</span> 开火，<span class="key">Esc</span> 暂停。
+      </p>
+      <p><button id="bootStart" style="margin-top:8px;padding:10px 26px;font-size:15px;border-radius:8px;cursor:pointer;
+        border:1px solid rgba(0,208,255,.5);background:rgba(0,208,255,.14);color:#dff6ff">开始</button></p>
+    </div>
+  </div>
+
+  <div id="fatal"><div class="box"><h2>启动失败</h2><pre id="fatalMsg"></pre>
+    <p style="color:#9bb6c8;font-size:13px">请确认浏览器支持 WebGL2，并且通过 HTTP 服务器打开（不要直接双击 index.html）。<br>
+    例如在项目目录执行：<code>npm start</code> 然后访问 <code>http://localhost:8080</code></p></div></div>
+
+  <noscript>本游戏需要启用 JavaScript 与 WebGL。</noscript>
+
+  <style>
+    /* ---------- 移动端适配 ---------- */
+    body.sp2-touch-device #boot .box { padding: 16px; }
+    body.sp2-touch-device #boot p { font-size: 13px; }
+    body.sp2-touch-device #bootStart { padding: 14px 40px !important; font-size: 17px !important; }
+    body.sp2-touch-device .sp2-menu__inner { width: 96vw; max-height: 96vh; }
+    body.sp2-touch-device .sp2-title { font-size: clamp(22px, 7vw, 34px) !important; }
+    body.sp2-touch-device .sp2-grid { grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 8px; }
+    body.sp2-touch-device .sp2-card { padding: 10px 12px; }
+    body.sp2-touch-device .sp2-card__desc { font-size: 11px; }
+    /* 横屏提示 */
+    #rotateHint { display: none; }
+    @media (orientation: portrait) and (pointer: coarse) {
+      body.sp2-touch-device #rotateHint {
+        display: flex; position: fixed; inset: 0; z-index: 95; align-items: center; justify-content: center;
+        background: rgba(5,8,13,.86); color: #9fe6ff; font-size: 16px; text-align: center; padding: 24px;
+        flex-direction: column; gap: 14px;
+        pointer-events: none;               /* 只是提示，不拦截操作 */
+        transition: opacity .4s ease; animation: rotateFade 3.5s forwards;
+      }
+    }
+    @keyframes rotateFade { 0%,70% { opacity: 1; } 100% { opacity: 0; } }
+    /* 面板/列表在触屏上要能纵向滚动（body 不再禁用触摸手势） */
+    .sp-scroll, .sp-panel__body, .sp-listbox, .sp-modal__body,
+    .sp2-menu__inner, .sp2-scroll, #ui [style*="overflow"] {
+      touch-action: pan-y;
+      -webkit-overflow-scrolling: touch;
+    }
+    /* 滑块在触屏上允许横向拖动 */
+    .sp-slider, .sp-slider * { touch-action: none; }
+    /* 安全区（刘海/小白条） */
+    .sp2-menu__inner { padding-left: env(safe-area-inset-left); padding-right: env(safe-area-inset-right); }
+  </style>
+  <div id="rotateHint"><div style="font-size:44px">📱↻</div><div>请把手机横过来以获得最佳飞行体验</div></div>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "./vendor/three.module.js"
+    }
+  }
+  </script>
+
+  <script>
+    // 全局错误兜底
+    window.addEventListener('error', (e) => {
+      const box = document.getElementById('fatal');
+      const msg = document.getElementById('fatalMsg');
+      if (box && msg && !window.__sp2Started) {
+        box.style.display = 'flex';
+        msg.textContent = (e.error && e.error.stack) || e.message || String(e);
+      }
+    });
+    window.addEventListener('unhandledrejection', (e) => {
+      console.error('未处理的 Promise 拒绝', e.reason);
+    });
+    const bs = document.getElementById('bootStatus');
+    const startBtn = document.getElementById('bootStart');
+    const boot = document.getElementById('boot');
+    let started = false;
+    const go = async () => {
+      if (started) return; started = true;
+      if (bs) bs.textContent = '正在载入游戏模块…';
+      try {
+        await import('./src/main.js');
+        window.__sp2Started = true;
+        boot?.classList.add('hide');
+        setTimeout(() => boot?.remove(), 700);
+      } catch (err) {
+        const box = document.getElementById('fatal');
+        document.getElementById('fatalMsg').textContent = (err && err.stack) || String(err);
+        box.style.display = 'flex';
+      }
+    };
+    startBtn?.addEventListener('click', go);
+    window.addEventListener('keydown', go, { once: true });
+    window.addEventListener('pointerdown', go, { once: true });
+  </script>
+</body>
+</html>

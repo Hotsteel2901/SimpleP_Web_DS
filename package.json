@@ -1,0 +1,34 @@
+{
+  "name": "simpleplanes2-three",
+  "version": "1.0.0",
+  "description": "SimplePlanes 2 复刻（three.js）：程序化建造、飞行物理、9 张地图、11 种玩法、实时合成音乐音效",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "check": "node scripts/check.mjs",
+    "test": "node scripts/check.mjs && node tests/damage-test.mjs && node tests/reset-test.mjs && node tests/flight-test.mjs 0 && node tests/integration.mjs && node tests/headless.mjs archipelago combat && node tests/net-server.mjs && node tests/mp-e2e.mjs",
+    "test:flight": "node tests/flight-test.mjs",
+    "test:world": "node tests/integration.mjs",
+    "test:game": "node tests/headless.mjs archipelago combat",
+    "test:ui": "node tests/ui-smoke.mjs",
+    "test:boot": "node tests/boot-smoke.mjs   # 需要 jsdom：npm i -D jsdom",
+    "test:net": "node tests/net-server.mjs",
+    "test:mp": "node tests/mp-e2e.mjs",
+    "test:mobile": "node tests/touch-smoke.mjs",
+    "test:mobile-boot": "node tests/mobile-boot.mjs",
+    "test:damage": "node tests/damage-test.mjs",
+    "test:reset": "node tests/reset-test.mjs"
+  },
+  "dependencies": {
+    "three": "^0.186.1"
+  },
+  "keywords": [
+    "three.js",
+    "flight-sim",
+    "simpleplanes",
+    "webgl",
+    "game"
+  ],
+  "license": "MIT"
+}
