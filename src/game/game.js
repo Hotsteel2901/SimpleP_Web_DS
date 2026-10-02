@@ -215,6 +215,12 @@ export class Game extends Emitter {
       timeOfDay: mapDef.timeOfDay ?? 0.4, cloudiness: mapDef.cloudiness ?? 0.4,
       radius: Math.min(13000, Math.max(7000, mapDef.size * 0.8)), shadows: this.renderer.shadowMap.enabled,
       shadowDistance: 420,
+      // PMREMGenerator 必须拿到真实 WebGLRenderer 才能跑预处理着色器；
+      // 之前没传 → new PMREMGenerator(null) → fromEquirectangular() 静默失败，
+      // 于是 scene.environment 永远是 null，金属/玻璃完全没有环境反射。
+      // 无头模式用桩渲染器，传 false 直接跳过 IBL。
+      renderer: this.headless ? null : this.renderer,
+      pmrem: !this.headless,
     });
     this.weather = new Weather(this.scene, { type: mapDef.weather || 'none', count: quality >= 2 ? 3600 : 1800 });
     this.projectiles = new ProjectileManager(this.scene, {

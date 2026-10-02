@@ -267,7 +267,10 @@ export class SkyDome {
     let rt = null;
     try {
       rt = this.pmrem.fromEquirectangular(tex);
-    } catch {
+    } catch (e) {
+      // 不静默：IBL 失败会让金属/玻璃失去反射，是「材质清晰度」的关键项，
+      // 出问题必须能看见，否则又会像之前那样被 try/catch 掩盖。
+      console.warn('[sky] PMREM 预处理失败，本次跳过 IBL', e);
       rt = null;
     }
     tex.dispose();
