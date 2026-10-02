@@ -8,12 +8,33 @@
  * 每帧 update() 完成：气动力 -> 发动机推力 -> 起落架/地面 -> 积水浮力 -> 积分 -> 损毁判定
  */
 import * as THREE from 'three';
-import { PART_DEFS, buildPartMesh, buildControlSurface, partFeatures, partMass } from '../build/parts.js';
-import { RigidBody, solveWing, airDensity, resolveSphereBox } from './physics.js';
+import { PART_DEFS, buildPartMesh, buildControlSurfaces, partFeatures, partMass } from '../build/parts.js';
+import { RigidBody, solveWing, airDensity, resolveSphereBox, acOffset } from './physics.js';
 import { clamp, clamp01, lerp, damp, DEG, RAD2DEG, TAU } from '../core/util.js';
 
 const _v = new THREE.Vector3(), _v2 = new THREE.Vector3(), _v3 = new THREE.Vector3(), _v4 = new THREE.Vector3();
 const _v5 = new THREE.Vector3(), _v6 = new THREE.Vector3(), _v7 = new THREE.Vector3();
+// 地面接触专用（与 _v1.._v7 隔离，保证热路径零分配且互不踩踏）
+const _g1 = new THREE.Vector3(), _g2 = new THREE.Vector3(), _g3 = new THREE.Vector3();
+const _g4 = new THREE.Vector3(), _g5 = new THREE.Vector3();
+const _bv = new THREE.Vector3();   // 翼面局部气流速度（每帧复用）
+const _wind = new THREE.Vector3(), _wind2 = new THREE.Vector3(); // 风场采样 / 本机当前风
+/** 螺旋桨反扭矩系数（N·m，油门 1 / rpm 1 时）。配平计算必须用同一个常量。 */
+const PROP_TORQUE = 260;
+/**
+ * 上反角“侧滑->滚转”耦合强度系数（1 = 教科书公式）。
+ * 真实值会让飞机有 2~5°/s 的螺旋不稳定性（真机靠飞行员/自动驾驶不停修正），
+ * 这里取 0.6 让「松手飞」也能保持大致平直，同时保留上反角的稳定手感。
+ */
+const DIHEDRAL_SCALE = 0.6;
+/**
+ * 短周期/荷兰滚目标阻尼比。面元模型只算出了尾翼那一份阻尼，
+ * 机翼/机身/非定常附着流那一份缺失，导致真实测量到的 ζ 只有 0.03~0.08
+ * （现象：抬轮后俯仰角来回振荡、机头一上一下、跟着侧滑甩滚转）。
+ * 这里在构造时测出固有刚度与固有阻尼，再补足到目标 ζ 的“阻尼增稳”力矩。
+ */
+const ZETA_PITCH = 0.5;
+const ZETA_YAW = 0.45;
 const _q = new THREE.Quaternion();
 const _e = new THREE.Euler();
 
@@ -47,12 +68,10 @@ export function buildCraftVisual(craft, opts = {}) {
     meshes.set(part.uid, mesh);
 
     const def = PART_DEFS[part.def];
-    // 可动控制面
-    const cs = buildControlSurface(part);
-    if (cs) {
-      cs.position.set(0, 0, 0);
-      mesh.add(cs);
-      controlSurfaces.push({ part, hinge: cs, type: cs.userData.controlType });
+    // 可动控制面（副翼/升降副翼左右各一块，因此是数组）
+    for (const hinge of buildControlSurfaces(part)) {
+      mesh.add(hinge);
+      controlSurfaces.push({ part, hinge, type: hinge.userData.controlType });
     }
     // 螺旋桨：单独一个可旋转组
     if (def?.isPropeller) {
@@ -153,48 +172,76 @@ export class Aircraft {
     if (opts.velocity) this.body.velocity.copy(opts.velocity);
 
     /* ---------------- 气动翼面 ---------------- */
+    // 一个翼类零件 = 一整片翼（展向关于零件原点对称）。位于机身中线的主翼会被拆成
+    // 左右两个半翼面，这样滚转力矩/滚转阻尼才是自然产生的；副翼也按左右两块布置。
     this.surfaces = [];
     for (const p of craft.parts) {
       const f = partFeatures(p);
       if (!f.aero || (f.aero.type !== 'wing' && f.aero.type !== 'plate')) continue;
       const a = f.aero;
       const dih = (a.dihedral != null ? a.dihedral : (p.props.dihedral ?? 0)) * DEG;
-      const localNormal = new THREE.Vector3(-Math.sin(dih), Math.cos(dih), 0);
-      const localChord = new THREE.Vector3(0, 0, 1);
-      const localSpan = new THREE.Vector3(Math.cos(dih), Math.sin(dih), 0);
       const rot = new THREE.Quaternion().setFromEuler(new THREE.Euler(p.rot[0] * DEG, p.rot[1] * DEG, p.rot[2] * DEG));
-      const pos = new THREE.Vector3(p.pos[0] - stats.com.x, p.pos[1] - stats.com.y, p.pos[2] - stats.com.z);
-      // 气动中心略在几何中心之后
-      const hingeOffset = new THREE.Vector3(0, 0, p.size[2] * (a.control ? 0.12 : 0));
-      const s = {
-        part: p, area: a.area, span: a.span, chord: a.chord, thick: a.thick ?? 0.12, cd0: a.cd0 ?? 0.012,
-        control: a.control || null, controlDir: 1, liftScale: 1,
-        normal: localNormal.clone().applyQuaternion(rot).normalize(),
-        chordDir: localChord.clone().applyQuaternion(rot).normalize(),
-        spanDir: localSpan.clone().applyQuaternion(rot).normalize(),
-        position: pos.add(hingeOffset.applyQuaternion(rot)),
-        hp: PART_DEFS[p.def]?.hp ?? 100,
-      };
-      // 舵面方向映射：
-      //  滚转 -> 按左右（+X 侧副翼上偏 => 右滚）
-      //  俯仰 -> 按舵面在重心之前/之后（鸭翼必须反向）
-      //  偏航 -> 按垂尾法线朝向
-      s.rollDir = p.pos[0] >= 0 ? -1 : 1;
-      s.pitchDir = (p.pos[2] - stats.com.z) >= 0 ? 1 : -1;
-      s.rudderDir = s.normal.x > 0 ? -1 : 1;
-      s.controlDir = s.pitchDir;
-      s.isWing = (a.type === 'wing' && !a.control && Math.abs(p.pos[0]) > 0.35);
-      this.surfaces.push(s);
-      // 主翼自动附带副翼（外侧 30% 展长）：独立气动面，产生真实滚转力矩
-      if (s.isWing) {
-        const outer = Math.abs(p.pos[0]) + a.span * 0.35;
-        this.surfaces.push({
-          part: p, area: a.area * 0.22, span: a.span * 0.3, chord: a.chord * 0.3, thick: a.thick ?? 0.12,
-          cd0: 0.02, control: 'aileron', rollDir: s.rollDir, controlDir: s.rollDir, liftScale: 1, isAileron: true,
-          normal: s.normal.clone(), chordDir: s.chordDir.clone(), spanDir: s.spanDir.clone(),
-          position: new THREE.Vector3(outer * Math.sign(p.pos[0]), s.position.y, s.position.z),
-          hp: s.hp,
-        });
+      const base = new THREE.Vector3(p.pos[0] - stats.com.x, p.pos[1] - stats.com.y, p.pos[2] - stats.com.z);
+      const normal = new THREE.Vector3(-Math.sin(dih) * DIHEDRAL_SCALE, Math.cos(dih), 0).applyQuaternion(rot).normalize();
+      const normalL = new THREE.Vector3(-Math.sin(dih) * DIHEDRAL_SCALE, Math.cos(dih), 0).applyQuaternion(rot).normalize();
+      normalL.x = -normalL.x;    // 左侧镜像（上反角方向相反）
+      const chordDir = new THREE.Vector3(0, 0, 1).applyQuaternion(rot).normalize();
+      const spanDir = new THREE.Vector3(Math.cos(dih), Math.sin(dih), 0).applyQuaternion(rot).normalize();
+      const hp = PART_DEFS[p.def]?.hp ?? 100;
+      const isMain = !!PART_DEFS[p.def]?.mainWing;
+      const incidence = (a.incidence ?? 0) * DEG;      // 安装角（尾翼 -2° / 鸭翼 +1.5°）
+      // 只有「水平放置」的翼面才吃机翼下洗（垂直尾翼吃的是侧洗，下洗是竖直速度分量，
+      // 对法线水平的垂尾没有迎角贡献；旧实现给它加下洗 → 每次都要 0.1 的方向舵配平）
+      const washable = Math.abs(normal.y) > 0.5;
+      // 气动中心（1/4 MAC）相对零件原点的偏移。翼面力必须作用在这里而不是弦中点，
+      // 否则俯仰力矩 / 中性点全错（三角翼能差出 1m 以上）
+      const acZ = acOffset(a.chord, a.taper ?? 1, a.sweep ?? 0);
+      const acZail = acOffset(a.chord * 0.3, 1, 0);
+      // 俯仰方向：按舵面在重心之前/之后（鸭翼必须反向）；偏航方向：按垂尾法线朝向
+      const pitchDir = (p.pos[2] - stats.com.z) >= 0 ? 1 : -1;
+      const rudderDir = normal.x > 0 ? -1 : 1;
+      // 仅当舵面零件本身时才有铰链偏移（气动中心略靠后）
+      const hingeZ = a.control ? p.size[2] * 0.12 : 0;
+
+      const mkAileron = (x, sgn) => ({
+        part: p, area: a.area * 0.1, span: a.span * 0.175, chord: a.chord * 0.3, thick: a.thick ?? 0.12,
+        cd0: 0.02, control: 'aileron', rollDir: sgn > 0 ? -1 : 1, controlDir: sgn > 0 ? -1 : 1, liftScale: 1, isAileron: true,
+        normal: (sgn > 0 ? normal : normalL).clone(), chordDir: chordDir.clone(), spanDir: spanDir.clone(), incidence, washable,
+        position: new THREE.Vector3(base.x + x, base.y, base.z + hingeZ + acZail), hp,
+      });
+
+      const centered = (a.type === 'wing' && !a.control && Math.abs(base.x) < Math.min(0.75, a.span * 0.3));
+      if (centered) {
+        for (const sgn of [-1, 1]) {
+          this.surfaces.push({
+            part: p, area: a.area * 0.5, span: a.span * 0.5, chord: a.chord, thick: a.thick ?? 0.12, cd0: a.cd0 ?? 0.012,
+            control: null, controlDir: 1, liftScale: 1, isWing: true, halfWing: true, incidence,
+            // 上反角法线左右镜像：否则两侧机翼的“侧滑→差动迎角”会互相抵消，失去滚转静稳定性
+            normal: (sgn > 0 ? normal : normalL).clone(), chordDir: chordDir.clone(), spanDir: spanDir.clone(), washable,
+            position: new THREE.Vector3(base.x + sgn * a.span * 0.25, base.y, base.z + acZ),
+            rollDir: sgn > 0 ? -1 : 1, pitchDir, rudderDir, hp,
+          });
+          if (isMain) this.surfaces.push(mkAileron(sgn * a.span * 0.4125, sgn));
+        }
+      } else {
+        const s = {
+          part: p, area: a.area, span: a.span, chord: a.chord, thick: a.thick ?? 0.12, cd0: a.cd0 ?? 0.012,
+          control: a.control || null, controlDir: 1, liftScale: 1, incidence, washable,
+          normal: normal.clone(), chordDir: chordDir.clone(), spanDir: spanDir.clone(),
+          position: new THREE.Vector3(base.x, base.y, base.z + hingeZ + acZ),
+          hp,
+        };
+        s.rollDir = base.x >= 0 ? -1 : 1;
+        s.pitchDir = pitchDir;
+        s.rudderDir = rudderDir;
+        s.controlDir = pitchDir;
+        s.isWing = (a.type === 'wing' && !a.control && Math.abs(base.x) > 0.35);
+        this.surfaces.push(s);
+        // 偏离中线的主翼：自动附带外侧副翼（真实滚转力矩）
+        if (s.isWing) {
+          const sgn = base.x >= 0 ? 1 : -1;
+          this.surfaces.push(mkAileron(sgn * (Math.abs(base.x) + a.span * 0.35), sgn));
+        }
       }
     }
 
@@ -207,8 +254,29 @@ export class Aircraft {
       }
       this.frontalArea = Math.max(0.3, maxA * 1.15 + Math.max(0, sumA - maxA) * 0.22);
     }
+    // 机翼气动中心的 z：用来区分「机翼之后」的尾翼（下洗）与「机翼之前」的鸭翼（上洗）
+    {
+      let za = 0, aa = 0;
+      for (const s of this.surfaces) if (s.isWing) { za += s.position.z * s.area; aa += s.area; }
+      this.wingACz = aa > 0 ? za / aa : 0;
+    }
 
     this._buildSystems();
+
+    /* ---------------- 配平 / 阻尼增稳 ---------------- */
+    // 巡航状态下三轴力矩为零所需的舵量 + 短周期/荷兰滚阻尼补足量。
+    // 没有它，重心或尾翼稍有偏差就会「一松手就低头俯冲」，抬轮后还会持续振荡。
+    const aero = this._analyzeAero();
+    this.pitchTrim = aero.pitch;
+    this.yawTrim = aero.yaw;
+    this.rollTrim = aero.roll;
+    this.dampPitch = aero.dampPitch || 0;
+    this.dampYaw = aero.dampYaw || 0;
+    this.dampRoll = aero.dampRoll || 0;
+    this.rollSlope = aero.rollSlope || 0;
+    this.qRef = aero.qRef || 0;
+    /** 螺旋桨反扭矩在线配平：当前需要抵消的滚转力矩 / 舵面滚转力矩斜率 */
+    this._propTorque = 0;
 
     /* ---------------- 其他 ---------------- */
     this.hasChute = craft.parts.some((p) => PART_DEFS[p.def]?.chute);
@@ -217,6 +285,9 @@ export class Aircraft {
     this.cargoParts = craft.parts.filter((p) => PART_DEFS[p.def]?.cargo).map((p) => p.uid);
     this.radius = Math.max(1.5, stats.size.length() * 0.42);
     this.collisionSpheres = this._buildCollisionSpheres(stats, 4);
+    // 机腹/尾椎接触点：正常滑跑时离地，抬轮过度会“尾椎擦地”被压住，
+    // 起落架全没了也能用肚子迫降（旧实现只有包围球，抬轮 20°+ 会直接翻过去）
+    this.bellyPoints = this._buildBellyPoints(stats);
 
     /* ---------------- 控制 ---------------- */
     this.controls = {
@@ -271,6 +342,125 @@ export class Aircraft {
     this.pendingDetach = [];
     this.gForce = 1;
     this.updateVisualTransform();
+  }
+
+  /**
+   * 气动分析（构造时只跑一次）：巡航配平舵量 + 阻尼增稳增益 + 操纵功率。
+   * ------------------------------------------------------------------
+   * 1) 配平：在巡航设计点（平飞迎角、设计动压）用真正的 solveWing 做差商，
+   *    求俯仰/偏航/滚转三轴力矩归零所需的舵量。没有它，重心或尾翼稍有偏差就会
+   *    「一松手就低头俯冲」；方向舵配平的侧力经垂尾高度还会产生滚转力矩。
+   * 2) 阻尼：面元模型只算得出尾翼那一份俯仰/偏航阻尼，机翼+机身+非定常那部分缺失，
+   *    实测 ζ 只有 0.03~0.08 —— 抬轮后就会出现持续的俯仰振荡与荷兰滚。这里测出
+   *    固有刚度 K 与固有阻尼 D，补一块力矩把阻尼比抬到目标值。
+   * 3) 操纵功率：记录舵面滚转力矩斜率，供螺旋桨反扭矩的在线配平使用。
+   * @returns {{pitch:number,yaw:number,roll:number,dampPitch:number,dampYaw:number,rollSlope:number,qRef:number}}
+   * @private
+   */
+  _analyzeAero() {
+    const none = { pitch: 0, yaw: 0, roll: 0, dampPitch: 0, dampYaw: 0, rollSlope: 0, qRef: 0 };
+    let wingArea = 0, wingCL = 0;
+    for (const s of this.surfaces) if (s.isWing && !s.isAileron) wingArea += s.area;
+    if (wingArea < 0.5 || this.surfaces.length < 2) return none;
+
+    const W = this.body.mass * 9.81;
+    const rho = 1.225;
+    // 巡航设计速度：平飞所需 CL≈0.35（真实飞机的巡航升力系数区间）
+    const V = clamp(Math.sqrt(2 * W / (rho * wingArea * 0.35)), 45, 140);
+    const qRef = 0.5 * rho * V * V;
+    const out = { forceLocal: new THREE.Vector3(), alpha: 0, cl: 0, cd: 0, stall: false, q: 0 };
+    const bv = new THREE.Vector3(), vLoc = new THREE.Vector3(), rArm = new THREE.Vector3();
+    const ctlA = { pitch: 0, roll: 0, yaw: 0, flap: 0, airbrake: 0 };
+
+    /** 在给定迎角/侧滑/机体角速度下的气动力矩（与 update() 的下洗模型完全一致） */
+    const moments = (ctl, alpha, beta = 0, wx = 0, wy = 0, wz = 0) => {
+      const ca = Math.cos(alpha), sa = Math.sin(alpha), cb = Math.cos(beta), sb = Math.sin(beta);
+      bv.set(sb * V, -sa * V * cb, -ca * V * cb);
+      const downwash = -clamp(wingCL, -1.4, 1.4) * 0.11;
+      let mx = 0, my = 0, mz = 0, lift = 0, side = 0;
+      for (const s of this.surfaces) {
+        if (s.detached) continue;
+        const wash = (!s.washable || s.isWing || s.isAileron) ? 0 : (s.position.z >= this.wingACz ? downwash : -downwash * 0.5);
+        s.alphaOffset = (s.incidence || 0) + wash;
+        // v_local = v_body + ω × r（机体坐标，分析时姿态为单位四元数）
+        rArm.copy(s.position);
+        vLoc.set(
+          bv.x + (wy * rArm.z - wz * rArm.y),
+          bv.y + (wz * rArm.x - wx * rArm.z),
+          bv.z + (wx * rArm.y - wy * rArm.x),
+        );
+        solveWing(s, vLoc, rho, ctl, out);
+        const f = out.forceLocal;
+        mx += s.position.y * f.z - s.position.z * f.y;   // 机体 +X = 抬头
+        my += s.position.z * f.x - s.position.x * f.z;   // 机体 +Y = 左偏航
+        mz += s.position.x * f.y - s.position.y * f.x;   // 机体 +Z = 左滚
+        lift += f.y; side += f.x;
+      }
+      return { mx, my, mz, lift, side };
+    };
+
+    // 迭代求平飞迎角（机翼升力 ≈ 重量）
+    let alpha = 0.06;
+    const need = W / (qRef * wingArea);
+    for (let it = 0; it < 8; it++) {
+      const ca = Math.cos(alpha), sa = Math.sin(alpha);
+      bv.set(0, -sa * V, -ca * V);
+      let clSum = 0, areaSum = 0;
+      for (const s of this.surfaces) {
+        if (!s.isWing || s.detached) continue;
+        solveWing(s, bv, rho, ctlA, out);
+        clSum += out.cl * s.area; areaSum += s.area;
+      }
+      const cl = areaSum > 0 ? clSum / areaSum : 0;
+      wingCL = cl;
+      alpha = clamp(alpha + (need - cl) * 0.22, -0.2, 0.5);
+    }
+
+    /* ---------------- 1) 配平 ---------------- */
+    const m0 = moments(ctlA, alpha);
+    const mP = moments({ pitch: 0.1, roll: 0, yaw: 0, flap: 0, airbrake: 0 }, alpha);
+    const mY = moments({ pitch: 0, roll: 0, yaw: 0.1, flap: 0, airbrake: 0 }, alpha);
+    const pitchSlope = (mP.mx - m0.mx) / 0.1;
+    const yawSlope = (mY.my - m0.my) / 0.1;
+    const pitch = Math.abs(pitchSlope) < 1 ? 0 : clamp(-m0.mx / pitchSlope, -0.6, 0.6);
+    const yaw = Math.abs(yawSlope) < 1 ? 0 : clamp(-m0.my / yawSlope, -0.4, 0.4);
+    // 滚转配平：带着俯仰/偏航配平再求一次（方向舵侧力经垂尾高度产生滚转力矩）。
+    // 螺旋桨反扭矩不在这里配平 —— 它随油门变化，运行时用舵面在线配平（见 _propTorque）。
+    const baseCtl = { pitch, roll: 0, yaw, flap: 0, airbrake: 0 };
+    const mB = moments(baseCtl, alpha);
+    const mR = moments({ pitch, roll: 0.1, yaw, flap: 0, airbrake: 0 }, alpha);
+    const rollSlope = (mR.mz - mB.mz) / 0.1;
+    const roll = Math.abs(rollSlope) < 1 ? 0 : clamp(-mB.mz / rollSlope, -0.3, 0.3);
+
+    /* ---------------- 2) 阻尼增稳 ---------------- */
+    // 固有刚度（恢复力矩斜率，正值 = 稳定）与固有阻尼
+    const dp = moments(baseCtl, alpha + 0.04).mx - moments(baseCtl, alpha - 0.04).mx;
+    const Kpitch = -dp / 0.08;
+    const dy = moments(baseCtl, alpha, 0.06).my - moments(baseCtl, alpha, -0.06).my;
+    const Kyaw = -dy / 0.12;
+    const dq = moments(baseCtl, alpha, 0, 0.4).mx - moments(baseCtl, alpha, 0, -0.4).mx;
+    const DpitchNat = -dq / 0.8;
+    const dr = moments(baseCtl, alpha, 0, 0, 0.4).my - moments(baseCtl, alpha, 0, 0, -0.4).my;
+    const DyawNat = -dr / 0.8;
+    const I = this._baseInertia;
+    const dPitchTarget = 2 * ZETA_PITCH * Math.sqrt(Math.max(4, Kpitch) * I.x);
+    const dYawTarget = 2 * ZETA_YAW * Math.sqrt(Math.max(4, Kyaw) * I.y);
+    // 只补差额，且不超过目标本身的 1.25 倍（避免玩家自建畸形机型出现“糊住”的手感）
+    const dampPitch = clamp(dPitchTarget - Math.max(0, DpitchNat), 0, dPitchTarget * 1.25);
+    const dampYaw = clamp(dYawTarget - Math.max(0, DyawNat), 0, dYawTarget * 1.25);
+    // 滚转本身阻尼已经很大（面板展向流动），只做兜底：ζ 过低时补一点
+    const droll = moments(baseCtl, alpha, 0, 0, 0, 0.5).mz - moments(baseCtl, alpha, 0, 0, 0, -0.5).mz;
+    const DrollNat = -droll / 1.0;
+    const dRollTarget = 2 * 0.5 * Math.sqrt(Math.max(4, Math.abs(rollSlope) * 2.5) * I.z);
+    const dampRoll = clamp(dRollTarget - Math.max(0, DrollNat), 0, dRollTarget * 1.25);
+
+    return {
+      pitch: Math.abs(pitch) < 0.01 ? 0 : pitch,
+      yaw: Math.abs(yaw) < 0.002 ? 0 : yaw,
+      roll: Math.abs(roll) < 0.005 ? 0 : roll,
+      dampPitch, dampYaw, dampRoll,
+      rollSlope, qRef, alpha, V,
+    };
   }
 
   /**
@@ -345,6 +535,30 @@ export class Aircraft {
 
   }
 
+  /**
+   * 机腹轮廓接触点（沿机身纵轴取若干站点，取该处机身/座舱的最低点）。
+   * 相对质心坐标，与刚体位置同系。用于尾椎擦地 / 机腹迫降。
+   */
+  _buildBellyPoints(stats, n = 6) {
+    const out = [];
+    const b = stats.bounds;
+    for (let i = 0; i < n; i++) {
+      const z = lerp(b.minZ, b.maxZ, n === 1 ? 0.5 : i / (n - 1));
+      let y = Infinity;
+      for (const p of this.craft.parts) {
+        const d = PART_DEFS[p.def];
+        if (!d || (d.cat !== 'fuselage' && d.cat !== 'cockpit')) continue;
+        const half = p.size[2] * 0.5;
+        if (z < p.pos[2] - half || z > p.pos[2] + half) continue;
+        y = Math.min(y, p.pos[1] - p.size[1] * 0.5);
+      }
+      if (!Number.isFinite(y)) continue;
+      out.push({ pos: new THREE.Vector3(0, y - stats.com.y, z - stats.com.z), r: 0.16 });
+    }
+    return out;
+  }
+
+  /** 碰撞球（沿机身纵轴分布）。中心为**相对质心**的坐标，与刚体位置同系。 */
   _buildCollisionSpheres(stats, n = 4) {
     const out = [];
     const b = stats.bounds;
@@ -352,7 +566,7 @@ export class Aircraft {
     const r = Math.max(0.8, Math.min(stats.size.x, stats.size.y) * 0.28 + len * 0.06);
     for (let i = 0; i < n; i++) {
       const t = n === 1 ? 0.5 : i / (n - 1);
-      out.push({ center: new THREE.Vector3(stats.com.x, stats.com.y, lerp(b.minZ, b.maxZ, t)), radius: r });
+      out.push({ center: new THREE.Vector3(0, 0, lerp(b.minZ, b.maxZ, t) - stats.com.z), radius: r });
     }
     return out;
   }
@@ -392,20 +606,46 @@ export class Aircraft {
     /* --- 环境 --- */
     const altASL = body.position.y;
     const density = airDensity(altASL) * (env.airDensityScale ?? 1);
-    const wind = env.wind || _v4.set(0, 0, 0);
+    // 风：支持「随位置变化的风场」（高度梯度 / 地形爬坡气流 / 阵风湍流）
+    const wind = env.windAt
+      ? env.windAt(body.position.x, body.position.y, body.position.z, _wind)
+      : (env.wind || _wind.set(0, 0, 0));
     _v.copy(body.velocity).sub(wind); // 相对气流
+    this.windLocal = _wind2.copy(wind);
 
     body.clearForces();
     this.liftAccum = 0; this.dragAccum = 0; this.thrustAccum = 0;
     this.aoaAccum = 0; this.aoaWeight = 0;
     let stalled = false;
 
+    /* --- 螺旋桨反扭矩：绕机体纵轴（真实的反作用扭矩轴），按油门/rpm 变化 --- */
+    // 先算出本帧要施加的扭矩，再用副翼“在线配平”抵消它 —— 这样从滑跑到巡航、
+    // 任意油门都不会残留滚转力矩（旧实现按满油门配平，小油门时留下一半反向力矩，
+    // 飞机就会慢慢侧滑→上反角耦合甩滚转）。
+    let propTorque = 0;
+    for (const e of this.engines) {
+      if (e.type !== 'prop' && e.type !== 'turboprop') { e.torqueNow = 0; continue; }
+      e.torqueNow = PROP_TORQUE * (e.spec.propRadius || 1) * e.rpm01 * c.throttle;
+      propTorque += e.torqueNow;
+    }
+    this.propTorqueNow = propTorque;
+    const qNow = 0.5 * density * _v.lengthSq();
+    // 动压不足（停放/推车）时不给舵面配平，避免地面上乱打副翼
+    const propTrim = (propTorque > 0.5 && Math.abs(this.rollSlope) > 1 && qNow > 20)
+      ? clamp(-propTorque / (this.rollSlope * (qNow / Math.max(1, this.qRef))), -0.4, 0.4)
+      : 0;
+
     /* --- 气动 --- */
-    const ctl = { pitch: c.pitch, roll: c.roll, yaw: c.yaw, flap: c.flaps, airbrake: c.airbrake };
-    const bodyVel = new THREE.Vector3();
+    const ctl = {
+      pitch: clamp(c.pitch + this.pitchTrim, -1, 1),
+      roll: clamp(c.roll + (this.rollTrim || 0) + propTrim, -1, 1),
+      yaw: clamp(c.yaw + this.yawTrim, -1, 1),
+      flap: c.flaps, airbrake: c.airbrake,
+    };
+    const bodyVel = _bv;
     const solveOne = (s, downwash) => {
       if (s.detached) return null;
-      s.alphaOffset = downwash;
+      s.alphaOffset = downwash + (s.incidence || 0);
       body.bodyVelocityAt(s.position, bodyVel);
       bodyVel.sub(_v5.copy(wind).applyQuaternion(_q.copy(body.quaternion).invert()));
       const res = solveWing(s, bodyVel, density, ctl, this._wingOut);
@@ -426,11 +666,13 @@ export class Aircraft {
       if (res && s.isWing) { wingCLSum += res.cl * s.area; wingAreaSum += s.area; }
     }
     this.lastWingCL = wingAreaSum > 0 ? wingCLSum / wingAreaSum : 0;
-    // 下洗：主翼后方的尾翼有效迎角降低（缺此项会导致飞机持续低头）
-    const downwash = -clamp(this.lastWingCL, -1.4, 1.4) * 0.11;
+    // 下洗只影响机翼**之后**的水平翼面（水平尾翼）；机翼之前的鸭翼受的是上洗；
+    // 垂直尾翼不受下洗（竖直速度分量在它的法线方向上没有投影）
+    const dw = -clamp(this.lastWingCL, -1.4, 1.4) * 0.11;
+    const up = -dw * 0.5;
     for (const s of this.surfaces) {
       if (s.isWing || s.isAileron) continue;
-      solveOne(s, downwash);
+      solveOne(s, s.washable ? (s.position.z >= this.wingACz ? dw : up) : 0);
     }
 
     /* --- 机身寄生阻力 + 侧滑 --- */
@@ -443,6 +685,20 @@ export class Aircraft {
       const dragF = _v2.multiplyScalar(-mag);
       body.applyForce(dragF, body.position);
       this.dragAccum += mag;
+    }
+
+    /* --- 阻尼增稳（俯仰/偏航/滚转） --- */
+    // 面元模型天然只算得出尾翼/机翼那一份旋转阻尼，实测短周期 ζ≈0.05（真机 0.3~0.7）。
+    // 这里补上机翼/机身/非定常附着流的缺失部分，随动压缩放：低速不糊手，高速能收敛。
+    if (this.dampPitch > 0 || this.dampYaw > 0 || this.dampRoll > 0) {
+      const qr = clamp(qNow / Math.max(1, this.qRef), 0, 8);
+      _q.copy(body.quaternion).invert();
+      _v6.copy(body.angularVelocity).applyQuaternion(_q);   // 机体角速度
+      body.applyTorque(_v7.set(
+        -this.dampPitch * _v6.x * qr,
+        -this.dampYaw * _v6.y * qr,
+        -this.dampRoll * _v6.z * qr,
+      ).applyQuaternion(body.quaternion));
     }
 
     /* --- 发动机 --- */
@@ -482,10 +738,8 @@ export class Aircraft {
         body.applyForce(_v3.copy(thrustDir).multiplyScalar(T), _v4.copy(e.position).applyQuaternion(body.quaternion).add(body.position));
         this.thrustAccum += T;
       }
-      // 螺旋桨扭矩效应（真实存在的偏转倾向）
-      if (e.active && (e.type === 'prop' || e.type === 'turboprop')) {
-        body.applyTorque(_v3.set(0, -c.throttle * 260 * e.rpm01 * (e.spec.propRadius || 1), 0));
-      }
+      // 螺旋桨反扭矩：绕机体纵轴（螺旋桨的旋转轴）→ 左滚趋势，由上面的 propTrim 抵消
+      if (e.torqueNow) body.applyTorque(_v3.set(0, 0, e.torqueNow).applyQuaternion(body.quaternion));
     }
     if (fuelRate > 0 && this.fuel > 0) this.fuel = Math.max(0, this.fuel - fuelRate * dt);
     if (this.fuel <= 0 && this.hasEngine) this.warnings.add('FUEL');
@@ -511,7 +765,7 @@ export class Aircraft {
       const isWater = terrain ? terrain.isWater(wp.x, wp.z) : false;
       const targetY = gh + g.radius;
       if (wp.y <= targetY) {
-        const n = (terrain && !isWater) ? terrain.normalAt(wp.x, wp.z) : _v4.set(0, 1, 0);
+        const n = (terrain && !isWater) ? terrain.normalAt(wp.x, wp.z, _g1) : _g1.set(0, 1, 0);
         // 限制最大穿透，防止初速穿透造成爆炸性弹力
         const pen = Math.min(targetY - wp.y, Math.max(g.travel * 2.2, 0.5));
         maxPen = Math.max(maxPen, pen);
@@ -522,17 +776,17 @@ export class Aircraft {
         if (isWater) { Fn = Math.max(0, Fn) * (g.float ? 1 : 0.2); onWater = true; }
         Fn = clamp(Fn, 0, 14 * body.mass * 9.81 / Math.max(1, this.gears.length));
         if (pen > g.travel) Fn += (pen - g.travel) * g.stiffness * 3; // 渐进式缓冲
-        const normalForce = _v7.copy(n).multiplyScalar(Fn);
-        body.applyForce(normalForce, wp);
+        body.applyForce(_v7.copy(n).multiplyScalar(Fn), wp);
         g.compression = clamp01(pen / Math.max(0.05, g.travel));
         g.contact = true; g.grounded = 1;
         this.groundContact = true;
 
-        // 摩擦：沿地形切向
-        const tangent = new THREE.Vector3().copy(vAt).addScaledVector(n, -vAt.dot(n));
+        // 摩擦：沿地形切向（全部用复用向量，热路径零分配）
+        const tangent = _g2.copy(vAt).addScaledVector(n, -vAt.dot(n));
         const tSpeed = tangent.length();
-        const wheelFwd = new THREE.Vector3(0, 0, -1).applyQuaternion(body.quaternion);
-        const wheelSide = new THREE.Vector3().crossVectors(n, wheelFwd).normalize();
+        const wheelFwd = _g3.set(0, 0, -1).applyQuaternion(body.quaternion);
+        const wheelSide = _g4.crossVectors(n, wheelFwd);
+        if (wheelSide.lengthSq() > 1e-6) wheelSide.normalize();
         if (tSpeed > 0.03) {
           tangent.multiplyScalar(1 / tSpeed);
           const rollFriction = isWater ? 0.015 : (g.ski ? 0.05 : 0.022);
@@ -543,17 +797,16 @@ export class Aircraft {
           const sideSpeed = vAt.dot(wheelSide);
           const desiredSide = -sideSpeed * mEff / Math.max(1e-3, dt);
           const maxSide = Fn * sideFriction;
-          body.applyForce(new THREE.Vector3().copy(wheelSide).multiplyScalar(clamp(desiredSide, -maxSide, maxSide)), wp);
+          body.applyForce(_g5.copy(wheelSide).multiplyScalar(clamp(desiredSide, -maxSide, maxSide)), wp);
           const maxRoll = Fn * (rollFriction + brakeF);
           const desiredRoll = -tSpeed * mEff / Math.max(1e-3, dt) * ((rollFriction + brakeF) / (rollFriction + brakeF + 2.5));
-          body.applyForce(new THREE.Vector3().copy(tangent).multiplyScalar(clamp(desiredRoll, -maxRoll, maxRoll)), wp);
+          body.applyForce(_g5.copy(tangent).multiplyScalar(clamp(desiredRoll, -maxRoll, maxRoll)), wp);
           g.spin += tSpeed * dt / Math.max(0.1, g.radius);
         }
         // 前轮转向
         if (g.steerable && !isWater && tSpeed > 1.5) {
           const authority = clamp(tSpeed / 25, 0.15, 1);
-          const steerDir = wheelSide.clone().multiplyScalar(-1); // 指向机体右侧
-          body.applyForce(steerDir.multiplyScalar(c.yaw * Fn * 0.75 * authority), wp);
+          body.applyForce(_g5.copy(wheelSide).multiplyScalar(-c.yaw * Fn * 0.75 * authority), wp);
         }
         // 用「接触点沿地面法线的速度」结算 —— 正常着陆只掉极少血，砸地才会断零件
         if (!isWater && Math.abs(vn) > 1.2) {
@@ -565,20 +818,36 @@ export class Aircraft {
     }
     this.onWater = onWater;
 
-    // 机体（无起落架时用包围球直接撞地）
-    if (!this.gears.length && terrain) {
-      const belly = _v3.copy(this.collisionSpheres[Math.floor(this.collisionSpheres.length / 2)]?.center || new THREE.Vector3()).applyQuaternion(body.quaternion).add(body.position);
-      const gh = terrain.heightAt(belly.x, belly.z);
-      const r = this.collisionSpheres[Math.floor(this.collisionSpheres.length / 2)]?.radius || 1.2;
-      if (belly.y - r < gh) {
-        const n = terrain.normalAt(belly.x, belly.z);
-        const pen = (gh + r) - belly.y;
-        const vn = body.velocity.dot(n);
-        const Fn = clamp(60000 * pen - 5000 * Math.min(0, vn), 0, 40 * body.mass);
-        body.applyForce(_v2.copy(n).multiplyScalar(Fn), belly);
-        body.applyForce(_v4.copy(body.velocity).multiplyScalar(-0.8 * Math.abs(Fn) / Math.max(1, body.velocity.length())), belly);
+    // 机腹 / 尾椎接地（抬轮过度、机腹迫降、起落架全毁）
+    if (terrain && this.bellyPoints.length) {
+      const gearDown = this.gears.length && c.gearT > 0.85;
+      for (const bp of this.bellyPoints) {
+        const wp = _v3.copy(bp.pos).applyQuaternion(body.quaternion).add(body.position);
+        const isWater = terrain.isWater ? terrain.isWater(wp.x, wp.z) : false;
+        const gh = terrain.heightAt(wp.x, wp.z);
+        const pen = gh + bp.r - wp.y;
+        if (pen <= 0) continue;
+        const n = (!isWater && terrain.normalAt) ? terrain.normalAt(wp.x, wp.z, _g1) : _g1.set(0, 1, 0);
+        const vAt = _v5.copy(body.velocity).add(_v6.crossVectors(body.angularVelocity, _v2.copy(wp).sub(body.position)));
+        const vn = vAt.dot(n);
+        let Fn = clamp(52000 * pen - 4200 * Math.min(0, vn), 0, (gearDown ? 22 : 30) * body.mass);
+        if (isWater) Fn *= 0.18;
+        body.applyForce(_v7.copy(n).multiplyScalar(Fn), wp);
+        // 拖地摩擦：尾椎擦地时产生低头力矩，压住继续抬头；机腹迫降则是减速阻力
+        const tangent = _g2.copy(vAt).addScaledVector(n, -vn);
+        const ts = tangent.length();
+        if (ts > 0.05 && !isWater) {
+          tangent.multiplyScalar(1 / ts);
+          const desired = -ts * (body.mass * 0.22) / Math.max(1e-3, dt) * 0.3;
+          body.applyForce(_g5.copy(tangent).multiplyScalar(clamp(desired, -Fn * 0.7, Fn * 0.7)), wp);
+        }
         this.groundContact = true;
-        if (Math.abs(body.velocity.dot(n)) > 1.2) this.applyImpact(Math.abs(body.velocity.dot(n)), belly, 'ground');
+        const scrape = Math.abs(vn);
+        if (scrape > 3 && !isWater) this.applyImpact(scrape * 0.45, wp, 'ground');
+        else if (scrape > 1.0 && this.onEvent && this._lastScrapeSfx + 0.4 < this.time) {
+          this._lastScrapeSfx = this.time;
+          this.onEvent('scrape', { aircraft: this, point: wp, speed: scrape });
+        }
       }
     }
 
@@ -639,17 +908,23 @@ export class Aircraft {
     const rollErr = e.z; // 期望 0
     const pitchErr = e.x - clamp(e.x, -0.28, 0.28); // 允许 ±16° 自由俯仰
     const wl = body.angularVelocity.clone().applyQuaternion(_q.copy(body.quaternion).invert());
-    // 只在玩家没有主动输入时介入
-    const free = (1 - Math.min(1, Math.abs(this.controls.roll) + Math.abs(this.controls.pitch)));
-    const kp = 1.2 * level * free, kd = 0.55 * level * free;
+    // 只在玩家没有主动输入对应通道时介入（俯仰输入不应关掉滚转保持）
+    const freeRoll = 1 - Math.min(1, Math.abs(this.controls.roll));
+    const freePitch = 1 - Math.min(1, Math.abs(this.controls.pitch));
+    const kpR = 1.2 * level * freeRoll, kdR = 0.55 * level * freeRoll;
+    const kpP = 1.2 * level * freePitch, kdP = 0.55 * level * freePitch;
     const I = body.inertia;
-    const tx = -(pitchErr * kp * I.x * 0.55 + wl.x * kd * I.x);
-    const tz = -(rollErr * kp * I.z * 0.5 + wl.z * kd * I.z);
-    body.applyTorque(new THREE.Vector3(tx, 0, tz));
-    // 迎角保护
+    // 辅助增益：足够把「缓慢螺旋」压住（真实飞机靠飞行员不停修正，这里交给电传）
+    const tx = -(pitchErr * kpP * I.x * 0.9 + wl.x * kdP * I.x * 1.2);
+    const tz = -(rollErr * kpR * I.z * 1.6 + wl.z * kdR * I.z * 1.6);
+    // 机体坐标 -> 世界坐标（刚体力矩是世界系的，直接给机体系分量会随姿态跑偏）
+    body.applyTorque(_v4.set(tx, 0, tz).applyQuaternion(body.quaternion));
+    // 迎角保护：明显超过限制时给一个低头力矩（真实电传的 α 限制器），平时不介入
     const s = this.state;
-    if (s.aoa > 0.30 && a > 0.3 && this.controls.pitch > -0.1) {
-      body.applyTorque(_v.set(this.controls.pitch * I.x * 3.0 * a, 0, 0));
+    const aoaLimit = 0.34;
+    if (a > 0.3 && s.aoa > aoaLimit && s.speed > 25) {
+      const excess = clamp01((s.aoa - aoaLimit) / 0.3);
+      body.applyTorque(_v4.set(-excess * I.x * 0.6 * a, 0, 0).applyQuaternion(body.quaternion));
     }
     // 自动油门（可选，保持空速）
     if (this.inputTarget.autoThrottle && this.hasEngine) {
@@ -708,18 +983,18 @@ export class Aircraft {
     this.group.position.copy(this.body.position);
     this.group.quaternion.copy(this.body.quaternion);
     const c = this.controls;
-    // 控制面偏转
+    // 控制面偏转（铰链在控制面前缘；右滚 = 右副翼上偏）
     for (const cs of this.controlMeshes) {
       let defl = 0;
+      const right = cs.hinge.position.x >= 0;
       switch (cs.type) {
         case 'elevator': defl = -c.pitch * 0.42; break;
-        case 'aileron': defl = c.roll * 0.36 * (cs.part.pos[0] >= 0 ? 1 : -1); break;
+        case 'aileron': defl = -c.roll * 0.36 * (right ? 1 : -1); break;
         case 'rudder': defl = c.yaw * 0.42; break;
         case 'flap': defl = c.flaps * 0.55; break;
-        case 'elevon': defl = -c.pitch * 0.32 + c.roll * 0.28 * (cs.part.pos[0] >= 0 ? 1 : -1); break;
+        case 'elevon': defl = -c.pitch * 0.32 - c.roll * 0.28 * (right ? 1 : -1); break;
       }
-      const axis = cs.type === 'rudder' ? 'y' : 'x';
-      if (axis === 'y') cs.hinge.rotation.y = Math.PI / 2 + defl; else cs.hinge.rotation.x = defl;
+      if (cs.type === 'rudder') cs.hinge.rotation.y = defl; else cs.hinge.rotation.x = defl;
     }
     // 螺旋桨旋转
     for (const p of this.propMeshes) {
@@ -1147,6 +1422,9 @@ export class Aircraft {
     }
     this.group.visible = true;   // 机体重新出现
     this.pendingDetach.length = 0;
+    // 掉件时翼面会被标记 detached（不再产生气动力）。重置必须清掉，
+    // 否则「修好的飞机」仍然缺一侧升力 —— 滑跑就开始滚转、拉不起来
+    for (const s of this.surfaces) s.detached = false;
     if (this.debris) { for (const d of this.debris) d.mesh.removeFromParent(); this.debris = []; }
     // ---- 完整修复：动力/起落架/油箱/武器全部重建，质量与惯性回到初始值 ----
     this._buildSystems();

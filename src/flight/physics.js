@@ -145,6 +145,30 @@ export class RigidBody {
 
 /* ------------------------------------------------------------------ 气动 */
 /**
+ * 翼面气动中心（焦点）相对「零件原点」的 z 偏移，单位米。
+ * ------------------------------------------------------------------
+ * 零件原点在翼根弦的中点（见 build/parts.js 的 wingGeometry 约定），而真实升力作用在
+ * 平均气动弦（MAC）的 1/4 处 —— 对带收缩比 / 后掠的翼面，这两点差得很远：
+ *   · 矩形翼（λ=1, 无后掠）：Δz = -0.25c
+ *   · 三角翼（λ=0.12, 后掠 2.4m）：Δz ≈ -0.18c
+ * 用错位置会让整机中性点评估差出 0.5m 量级，配平舵量与静稳定性全跑偏
+ * （现象就是「机翼看着装错地方」「一松手就抬头/低头」）。
+ * @param {number} chord 翼根弦长
+ * @param {number} taper 收缩比（1 = 矩形）
+ * @param {number} sweep 翼尖后掠量（米）
+ */
+export function acOffset(chord, taper = 1, sweep = 0) {
+  const lam = clamp(taper, 0.05, 1);
+  const mac = (2 / 3) * chord * (1 + lam + lam * lam) / (1 + lam);
+  const zLE = sweep * (1 + 2 * lam) / (3 * (1 + lam));   // MAC 前缘相对翼根前缘的后移
+  const acNormal = zLE + 0.25 * mac;                     // 常规翼：1/4 MAC（相对翼根前缘）
+  // 三角翼/小展弦比：前缘涡提供额外升力，焦点明显后移到 0.4~0.5 根弦
+  const slender = clamp((0.45 - lam) / 0.4, 0, 1);
+  const ac = lerp(acNormal, 0.45 * chord, slender * 0.7);
+  return ac - 0.5 * chord;
+}
+
+/**
  * 翼面气动求解。
  * @param {object} s 翼面描述（机体坐标系）
  *   { area, span, chord, thick, cd0, control, controlSign, position(THREE.Vector3 机体),
@@ -176,12 +200,13 @@ export function solveWing(s, vLocal, density, ctl, out) {
   let dCL = 0;
   let flapDrag = 0;
   if (s.control) {
-    const eff = 0.55 + 0.45 * clamp01(s.area / Math.max(0.2, s.area * 0 + 1.5));
-    if (s.control === 'elevator') dCL += -ctl.pitch * 0.92 * (s.pitchDir ?? s.controlDir ?? 1);
-    else if (s.control === 'aileron') dCL += ctl.roll * 0.62 * (s.rollDir ?? s.controlDir ?? 1);
-    else if (s.control === 'rudder') dCL += ctl.yaw * 0.75 * (s.rudderDir ?? s.controlDir ?? 1);
+    // 舵面效率：面积越大越接近 1（真实舵面占翼面 20~30% 时效率很高）
+    const eff = 0.7 + 0.3 * clamp01(s.area / 1.5);
+    if (s.control === 'elevator') dCL += -ctl.pitch * 1.15 * (s.pitchDir ?? s.controlDir ?? 1);
+    else if (s.control === 'aileron') dCL += ctl.roll * 0.75 * (s.rollDir ?? s.controlDir ?? 1);
+    else if (s.control === 'rudder') dCL += ctl.yaw * 0.85 * (s.rudderDir ?? s.controlDir ?? 1);
     else if (s.control === 'flap') { dCL += (ctl.flap ?? 0) * 1.05; flapDrag = (ctl.flap ?? 0) * 0.09; }
-    else if (s.control === 'elevon') dCL += (-ctl.pitch * 0.75 * (s.pitchDir ?? 1) + ctl.roll * 0.45 * (s.rollDir ?? 1));
+    else if (s.control === 'elevon') dCL += (-ctl.pitch * 0.85 * (s.pitchDir ?? 1) + ctl.roll * 0.5 * (s.rollDir ?? 1));
     else if (s.control === 'airbrake') { dCL *= 0; flapDrag = (ctl.airbrake ?? 0) * 1.4; }
     dCL *= eff;
   }

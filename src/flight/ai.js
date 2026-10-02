@@ -74,15 +74,23 @@ export class AIPilot {
       desired = r.dir;
     }
 
-    // 地形规避（拉起来）
+    // 地形规避：除了看高度，还要看「还有几秒撞地」（俯冲速度大时 AGL 再高也来不及）
     const minAgl = 90 + (1 - this.skill) * 90;
-    if (agl < minAgl && ac.body.velocity.y < 6) {
+    const vs = ac.body.velocity.y;
+    const tti = vs < -1 ? agl / -vs : Infinity;
+    const pullup = (agl < minAgl && vs < 6) || tti < 4.5 || (agl < 220 && vs < -25);
+    if (pullup) {
       desired = _v2.copy(desired).normalize().add(_v3.set(0, 1.4, 0)).normalize();
       throttle = 1;
       this.state = 'pullup';
     }
 
     this._steer(desired, dt);
+    // 保命机动不受过载限制器的约束（否则高速俯冲时 AI 拉不起来，一头扎进地里）
+    if (pullup) {
+      ac.inputTarget.pitch = 1;
+      ac.inputTarget.roll = damp(ac.inputTarget.roll || 0, 0, 3, dt);
+    }
     ac.inputTarget.throttle = clamp01(throttle);
     ac.controls.fire1 = fire;
     ac.controls.fire2 = false;

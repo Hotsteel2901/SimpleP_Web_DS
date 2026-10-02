@@ -5,7 +5,7 @@
  * 云层用一层平面贴图 + 若干广告牌云团。零外部资源。
  */
 import * as THREE from 'three';
-import { clamp, clamp01, lerp, smoothstep, makeRng } from '../core/util.js';
+import { clamp, clamp01, lerp, smoothstep, makeRng, makeSkyTexture } from '../core/util.js';
 
 /* ---------------------------------------------------------------- 色彩预设 */
 const KEYFRAMES = [
@@ -149,21 +149,33 @@ export class SkyDome {
     this.root.add(this.skyMesh);
 
     // 光照
+    this.scene = scene;
     this.hemi = new THREE.HemisphereLight(0xbcd9ff, 0x4a5a45, 0.6);
     scene.add(this.hemi);
     this.sun = new THREE.DirectionalLight(0xffffff, 2.0);
     this.sun.castShadow = !!opts.shadows;
     if (this.sun.castShadow) {
-      this.sun.shadow.mapSize.set(2048, 2048);
-      const d = opts.shadowDistance ?? 420;
+      // 阴影范围贴合跟随目标：范围越小，单位面积的阴影贴图分辨率越高（边缘越干净）
+      const quality = opts.quality ?? 1;
+      const res = quality >= 2 ? 4096 : quality >= 1 ? 2048 : 1024;
+      this.sun.shadow.mapSize.set(res, res);
+      const d = opts.shadowDistance ?? 260;
       this.sun.shadow.camera.left = -d; this.sun.shadow.camera.right = d;
       this.sun.shadow.camera.top = d; this.sun.shadow.camera.bottom = -d;
       this.sun.shadow.camera.near = 1; this.sun.shadow.camera.far = d * 4;
-      this.sun.shadow.bias = -0.0008;
-      this.sun.shadow.normalBias = 0.6;
+      this.sun.shadow.bias = -0.00035;
+      this.sun.shadow.normalBias = 0.35;
     }
     scene.add(this.sun);
     scene.add(this.sun.target);
+
+    // 环境贴图（IBL）：由天空渐变生成 PMREM，金属/玻璃才有真实反射
+    // —— 这是“材质清晰度”提升最明显的一步：没有它，金属反射只能用纯色近似
+    this.pmrem = (typeof THREE.PMREMGenerator === 'function' && opts.pmrem !== false)
+      ? new THREE.PMREMGenerator(opts.renderer || null)
+      : null;
+    this.envRT = null;
+    this._envT = -1;
 
     // 环境光（微弱补光，避免背光面纯黑）
     this.fill = new THREE.DirectionalLight(0x9fc4ff, 0.22);
@@ -224,9 +236,10 @@ export class SkyDome {
     this.sun.intensity = k.sunI;
     this.sun.position.copy(dir).multiplyScalar(1600);
     this.sun.target.position.set(0, 0, 0);
-    this.hemi.intensity = k.amb * 0.85 + 0.1;
+    this.hemi.intensity = k.amb * 0.7 + 0.08;
     this.hemi.color.copy(k.hor);
-    this.fill.intensity = 0.12 + k.amb * 0.2;
+    this.fill.intensity = 0.1 + k.amb * 0.16;
+    this._updateEnv(k);
     // 雾颜色跟随地平线
     this.fog.color.copy(k.hor).lerp(k.bot, 0.25);
     this.fog.density = 0.000075 + (1 - Math.max(0, elev)) * 0.00007;

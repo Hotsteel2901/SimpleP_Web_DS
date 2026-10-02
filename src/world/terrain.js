@@ -370,6 +370,9 @@ export class Terrain {
     // ---- 平整区 ----
     this._regions = this._normalizeRegions(o.flatRegions);
     if (this._regions.length === 0) this._regions = this._makeDefaultRegions();
+    // 地图里手工填的平整区高度常常和噪声地形差出几百米：直接照搬会在山里挖出巨坑、
+    // 或在海里立一根柱子。这里用平整区范围内的自然地形中位数做基准高度（切填平衡）。
+    this._reconcileRegions();
 
     // ---- 缓存/状态 ----
     this._heights = null;        // Float32Array((segments+1)^2) 网格顶点高度（与渲染完全一致）
@@ -1276,9 +1279,36 @@ export class Terrain {
         height: height,
         blend: blend,
         heading: Number.isFinite(r.heading) ? r.heading : 0,
+        fixed: r.fixed === true,
       });
     }
     return out;
+  }
+
+  /**
+   * 依据自然地形修正平整区高度：取该区域范围内（中心 + 半径 0.85 处的 6 个采样点）
+   * 自然地形高度的中位数，并夹紧到「海平面以上」的合理区间。
+   * 结果是跑道坐落在地面上（挖方/填方平衡），不再出现几百米深的坑或海中的孤柱。
+   * 若某个区域显式标记 `fixed: true` 则保留地图里写死的高度（浮空岛等特殊需求）。
+   * @private
+   */
+  _reconcileRegions() {
+    const rs = this._regions;
+    if (!rs.length) return;
+    const samples = [];
+    for (const r of rs) {
+      if (r.fixed) continue;
+      samples.length = 0;
+      samples.push(this._heightRaw(r.x, r.z));
+      for (let i = 0; i < 6; i++) {
+        const a = (i / 6) * Math.PI * 2 + 0.4;
+        samples.push(this._heightRaw(r.x + Math.cos(a) * r.radius * 0.85, r.z + Math.sin(a) * r.radius * 0.85));
+      }
+      samples.sort((a, b) => a - b);
+      const median = samples[samples.length >> 1];
+      r.authored = r.height;
+      r.height = clamp(median, this._seaLevel + 8, this._seaLevel + Math.max(80, this._heightScale * 1.05));
+    }
   }
 
   /** 未提供 flatRegions 时自动生成 3 个机场平地（保证 spawnPoints 一定有 3 个平坦出生点）。 */
