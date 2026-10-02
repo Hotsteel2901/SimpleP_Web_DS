@@ -239,7 +239,9 @@ export class SkyDome {
     this.hemi.intensity = k.amb * 0.7 + 0.08;
     this.hemi.color.copy(k.hor);
     this.fill.intensity = 0.1 + k.amb * 0.16;
-    this._updateEnv(k);
+    // IBL 是可选的锦上添花：即使生成失败（canvas/PMREM 不可用、贴图异常），
+    // 也绝不能让整个 loadWorld 挂掉 —— 否则游戏直接进不去。
+    try { this._updateEnv(k); } catch (e) { console.warn('[sky] 环境贴图生成失败，已跳过 IBL', e); this.pmrem = null; }
     // 雾颜色跟随地平线
     this.fog.color.copy(k.hor).lerp(k.bot, 0.25);
     this.fog.density = 0.000075 + (1 - Math.max(0, elev)) * 0.00007;
@@ -256,7 +258,10 @@ export class SkyDome {
   _updateEnv(k) {
     if (!this.pmrem) return;
     if (this._envT >= 0 && Math.abs(this.timeOfDay - this._envT) < 0.01) return;
-    const tex = makeSkyTexture(k.top.getHex(), k.hor.getHex(), k.bot.getHex());
+    // 注意：makeSkyTexture 的入参是 CSS 颜色字符串（内部走 canvas addColorStop）。
+    // k.top/hor/bot 是 THREE.Color，必须用 getStyle()（'rgb(r,g,b)'）而不是
+    // getHex()（十进制数字，传给 addColorStop 会抛 SyntaxError 并中断整个世界加载）。
+    const tex = makeSkyTexture(k.top.getStyle(), k.hor.getStyle(), k.bot.getStyle());
     if (!tex) return;
     tex.mapping = THREE.EquirectangularReflectionMapping;
     let rt = null;
