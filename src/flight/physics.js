@@ -178,11 +178,19 @@ export function acOffset(chord, taper = 1, sweep = 0) {
  * @param {object} ctl 控制输入 { pitch, roll, yaw, flap, airbrake, speed }
  * @param {object} out 复用的输出对象 { forceLocal:Vector3, alpha, cl, cd, stall, q }
  */
-export function solveWing(s, vLocal, density, ctl, out) {
+export function solveWing(s, vLocal, density, ctl, out, betaOverride) {
   const f = out.forceLocal.set(0, 0, 0);
   const u = vLocal.dot(s.chordDir);   // 弦向分量（前飞为负）
   const w = vLocal.dot(s.normal);     // 法向分量
-  const side = vLocal.dot(s.spanDir);
+  // 展向速度：只有「水平翼面」的展向流才等价于侧滑。
+  // 垂尾的展向是机体的 Y 轴，而机体 Y 方向的相对气流在正常抬头/低头时并不为零
+  // （那是迎角，已经计入 alpha）—— 若直接拿它当侧滑，垂尾会凭空产生巨大的
+  // 竖直力与低头力矩（实测 5.7° 迎角下凭空多出 2792N，把配平彻底带偏，
+  // 表现为「松手就爬升/掉高」）。因此侧滑统一由机体侧滑角 beta 给出。
+  const sideRaw = vLocal.dot(s.spanDir);
+  const side = Number.isFinite(betaOverride)
+    ? Math.sin(clamp(betaOverride, -1.2, 1.2)) * Math.abs(u || w || 1)
+    : sideRaw;
   const V2 = u * u + w * w + side * side * 0.35;
   const V = Math.sqrt(V2);
   out.q = 0.5 * density * V2;
@@ -240,8 +248,11 @@ export function solveWing(s, vLocal, density, ctl, out) {
   const qS = out.q * s.area;
   f.addScaledVector(_v2, qS * CL);
   f.addScaledVector(_v1, -qS * CD);
-  // 侧滑侧力（机身/垂尾的展向阻力）
-  const beta = Math.atan2(side, Math.max(1e-4, -u));
+  // 侧滑侧力：垂直翼面（垂尾/腹鳍）由真实侧滑角产生侧向力，水平翼面由展向流产生。
+  // 两者都归一到「该翼面的有效展向流」再算 beta，避免迎角分量被重复计入。
+  const beta = (s.washable === false)
+    ? clamp(betaOverride ?? 0, -0.6, 0.6)                      // 垂直翼面：直接用机体侧滑角
+    : Math.atan2(side, Math.max(1e-4, -u));                    // 水平翼面：展向流/弦向流
   f.addScaledVector(s.spanDir, -qS * clamp(beta, -0.6, 0.6) * (s.sideForce ?? 1.1));
   return out;
 }

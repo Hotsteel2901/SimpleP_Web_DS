@@ -1286,28 +1286,41 @@ export class Terrain {
   }
 
   /**
-   * 依据自然地形修正平整区高度：取该区域范围内（中心 + 半径 0.85 处的 6 个采样点）
-   * 自然地形高度的中位数，并夹紧到「海平面以上」的合理区间。
-   * 结果是跑道坐落在地面上（挖方/填方平衡），不再出现几百米深的坑或海中的孤柱。
-   * 若某个区域显式标记 `fixed: true` 则保留地图里写死的高度（浮空岛等特殊需求）。
+   * 依据自然地形修正平整区高度。
+   *
+   * 采样策略：以「面积加权平均」代替简单中位数 —— 用多层环状采样（中心 + 内环 + 外环）
+   * 近似该圆盘上的平均高程，使挖方≈填方，跑道整体贴在山坡上而不是局部削平。
+   * 陡坡地图（如群岛）单纯取中位数会被山顶或谷底拉偏几百米，故内环取较高权重：
+   * 机场需要的是「这一片地」的代表高度，而不是某个极值点。
+   *
+   * 结果：不再出现几百米深的坑（山中）或海中的孤柱。
+   * 若区域显式标记 `fixed: true` 则保留地图写死的高度（浮空岛等特殊设计）。
    * @private
    */
   _reconcileRegions() {
     const rs = this._regions;
     if (!rs.length) return;
-    const samples = [];
     for (const r of rs) {
       if (r.fixed) continue;
-      samples.length = 0;
-      samples.push(this._heightRaw(r.x, r.z));
-      for (let i = 0; i < 6; i++) {
-        const a = (i / 6) * Math.PI * 2 + 0.4;
-        samples.push(this._heightRaw(r.x + Math.cos(a) * r.radius * 0.85, r.z + Math.sin(a) * r.radius * 0.85));
-      }
-      samples.sort((a, b) => a - b);
-      const median = samples[samples.length >> 1];
       r.authored = r.height;
-      r.height = clamp(median, this._seaLevel + 8, this._seaLevel + Math.max(80, this._heightScale * 1.05));
+
+      // 中心 + 内环(0.55r) + 外环(0.9r)，按面积权重累积
+      let sum = 0, wsum = 0;
+      const acc = (dist, weight, n, phase) => {
+        for (let i = 0; i < n; i++) {
+          const a = (i / n) * Math.PI * 2 + phase;
+          const h = this._heightRaw(r.x + Math.cos(a) * dist, r.z + Math.sin(a) * dist);
+          sum += h * weight; wsum += weight;
+        }
+      };
+      acc(0, 1, 1, 0);                          // 中心
+      acc(r.radius * 0.55, 1, 6, 0.4);          // 内环（权重高：跑道主要在这片）
+      acc(r.radius * 0.9, 0.6, 8, 0.13);        // 外环（过渡带，权重低）
+      const mean = wsum > 0 ? sum / wsum : this._heightRaw(r.x, r.z);
+
+      const lo = this._seaLevel + 8;
+      const hi = this._seaLevel + Math.max(80, this._heightScale * 1.05);
+      r.height = clamp(mean, lo, hi);
     }
   }
 

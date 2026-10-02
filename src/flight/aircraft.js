@@ -18,6 +18,7 @@ const _v5 = new THREE.Vector3(), _v6 = new THREE.Vector3(), _v7 = new THREE.Vect
 const _g1 = new THREE.Vector3(), _g2 = new THREE.Vector3(), _g3 = new THREE.Vector3();
 const _g4 = new THREE.Vector3(), _g5 = new THREE.Vector3();
 const _bv = new THREE.Vector3();   // 翼面局部气流速度（每帧复用）
+const _vTrim = new THREE.Vector3(); // 配平速度求解用的气流方向临时量
 const _wind = new THREE.Vector3(), _wind2 = new THREE.Vector3(); // 风场采样 / 本机当前风
 /** 螺旋桨反扭矩系数（N·m，油门 1 / rpm 1 时）。配平计算必须用同一个常量。 */
 const PROP_TORQUE = 260;
@@ -275,6 +276,10 @@ export class Aircraft {
     this.dampRoll = aero.dampRoll || 0;
     this.rollSlope = aero.rollSlope || 0;
     this.qRef = aero.qRef || 0;
+    /** 设计巡航速度（配平点）——速度/配平辅助的参考空速 */
+    this.designV = aero.V || 0;
+    /** 配平俯仰角（= 平飞迎角）——姿态保持的目标角，避免把飞机按成 0° 俯冲 */
+    this.trimPitchAngle = aero.alpha || 0;
     /** 螺旋桨反扭矩在线配平：当前需要抵消的滚转力矩 / 舵面滚转力矩斜率 */
     this._propTorque = 0;
 
@@ -364,10 +369,19 @@ export class Aircraft {
     if (wingArea < 0.5 || this.surfaces.length < 2) return none;
 
     const W = this.body.mass * 9.81;
-    const rho = 1.225;
-    // 巡航设计速度：平飞所需 CL≈0.35（真实飞机的巡航升力系数区间）
-    const V = clamp(Math.sqrt(2 * W / (rho * wingArea * 0.35)), 45, 140);
-    const qRef = 0.5 * rho * V * V;
+    // 配平分析用的空气密度：取 2000m 标准大气（0.90 × 海平面）。
+    // 不能用海平面 1.225 —— 飞机绝大多数任务在数百到数千米高度飞行，那里密度
+    // 低 5~15%，同样的速度需要更大迎角（升力 ∝ ρV²），诱导阻力随之变大，真实
+    // 平衡速度比海平面解高约 5%。实测 Warhound 海平面解 143、实际稳定在 151，
+    // 差 5.6% 就是这么来的（连带 30s 掉高 300m）。统一用 2000m 密度可让配平点
+    // 落在常用飞行高度的中位，误差最小。
+    const rhoCruise = 1.103;   // 2000m 标准大气密度 kg/m³
+    const rho = rhoCruise;
+    // 设计巡航速度：先按「升力=重量（CL≈0.5 的舒适巡航点）」估一个初值，
+    // 再用真实推力曲线修正 ———— 见下方 solveTrimSpeed()。
+    const V0 = clamp(Math.sqrt(2 * W / (rho * wingArea * 0.5)), 40, 160);
+    let V = V0;
+    let qRef = 0.5 * rho * V * V;
     const out = { forceLocal: new THREE.Vector3(), alpha: 0, cl: 0, cd: 0, stall: false, q: 0 };
     const bv = new THREE.Vector3(), vLoc = new THREE.Vector3(), rArm = new THREE.Vector3();
     const ctlA = { pitch: 0, roll: 0, yaw: 0, flap: 0, airbrake: 0 };
@@ -389,7 +403,7 @@ export class Aircraft {
           bv.y + (wz * rArm.x - wx * rArm.z),
           bv.z + (wx * rArm.y - wy * rArm.x),
         );
-        solveWing(s, vLoc, rho, ctl, out);
+        solveWing(s, vLoc, rho, ctl, out, beta);
         const f = out.forceLocal;
         mx += s.position.y * f.z - s.position.z * f.y;   // 机体 +X = 抬头
         my += s.position.z * f.x - s.position.x * f.z;   // 机体 +Y = 左偏航
@@ -399,22 +413,92 @@ export class Aircraft {
       return { mx, my, mz, lift, side };
     };
 
-    // 迭代求平飞迎角（机翼升力 ≈ 重量）
+    /* ---------------- 0) 先定巡航速度，再定平飞迎角 ---------------- */
+    // 顺序很重要：迎角迭代要用到 qRef，而 qRef 由 V 决定。必须先把 V 定下来
+    // （推力=阻力平衡点），否则迎角是按错误的动压算出来的，配平点会整体偏移
+    // （实测 Skyfreighter 配平迎角 8.15°、实际收敛迎角 4.5°，差值被误当成
+    // 抬头力矩，表现为「松手后缓慢抬头减速直至失速」）。
+    const dragAtV = (Vq) => {
+      // 阻力对迎角不敏感（诱导阻力项是小量），用固定 4° 近似即可，
+      // 避免在迎角尚未求解时形成循环依赖
+      const aRef = 0.07;
+      const ca = Math.cos(aRef), sa = Math.sin(aRef);
+      bv.set(0, -sa * Vq, -ca * Vq);
+      const flow = _vTrim.copy(bv).normalize();
+      let drag = 0;
+      for (const s of this.surfaces) {
+        if (s.detached) continue;
+        s.alphaOffset = (s.incidence || 0);
+        solveWing(s, bv, rho, ctlA, out, 0);
+        drag += -out.forceLocal.dot(flow);
+      }
+      // 机身寄生阻力（与 update() 的 cdBody 同口径）—— 漏掉这一项会让求解出的
+      // 平衡速度偏小，实际飞到这个速度时 T/D < 1，飞机只能靠掉高来补偿推力缺口
+      // （实测 Warhound 在 159.6m/s 稳态时 T/D=0.812、升力/重量=0.986，
+      //  30s 掉高 400+m —— 就是这里少算了 0.13×前向面积的寄生阻力）。
+      drag += 0.5 * rho * Vq * Vq * (this.frontalArea || 0) * 0.13;
+      return Math.max(0, drag);
+    };
+    const trimV = this._solveTrimSpeed(dragAtV);
+    if (Number.isFinite(trimV) && trimV > 30) V = trimV;
+    qRef = 0.5 * rho * V * V;
+
+    // 迭代求平飞迎角：整机（机翼+平尾+升降舵）竖向升力 ≈ 重量。
+    // 留 4% 余量：面元模型没算机身升力，也没算机体-机翼干扰带来的升力损失，
+    // 实测按「升力=重量」求出的配平迎角偏小，飞机稳态时升力只有重量的 98.6%，
+    // 结果就是「速度锁住了、但一直缓慢掉高」（Warhound 60s 掉 700m）。
+    // 纯火箭机（Comet）不适用：它靠燃烧时段飞，没有稳定的平飞配平点，
+    // 加余量反而把迎角抬过头（实测 Δh 从 +80m 恶化到 +441m）。
+    const isRocket = this.engines.length > 0 && !this.engines.some((e) => e.type !== 'rocket');
+    const needLift = W * (isRocket ? 1.0 : 1.04);
     let alpha = 0.06;
-    const need = W / (qRef * wingArea);
+    for (let it = 0; it < 14; it++) {
+      const m = moments(ctlA, alpha);
+      const err = (needLift - m.lift) / (qRef * wingArea);
+      alpha = clamp(alpha + err * 0.16, -0.2, 0.5);
+    }
+    // 第二轮：用求得的迎角重算阻力，修正平衡速度。
+    // 首轮 dragAtV 用的是固定 4° 近似，而真实配平迎角往往只有 1~2°，
+    // 4° 的诱导阻力偏大，导致解出的 V 偏小约 8%，飞机实际会飞到比 designV
+    // 更快的速度上（实测 Warhound 134 -> 146）。用真迎角再解一次即收敛。
+    const dragAtAlpha = (Vq) => {
+      const ca = Math.cos(alpha), sa = Math.sin(alpha);
+      bv.set(0, -sa * Vq, -ca * Vq);
+      const flow = _vTrim.copy(bv).normalize();
+      // 下洗与 update() 同口径：平尾处在机翼洗流里，迎角被压低，
+      // 漏掉这一项会让平尾阻力/升力算偏，平衡速度也就偏了。
+      const dw = -clamp(wingCL, -1.4, 1.4) * 0.11;
+      let drag = 0;
+      for (const s of this.surfaces) {
+        if (s.detached) continue;
+        const wash = (!s.washable || s.isWing || s.isAileron) ? 0 : (s.position.z >= this.wingACz ? dw : -dw * 0.5);
+        s.alphaOffset = (s.incidence || 0) + wash;
+        solveWing(s, bv, rho, ctlA, out, 0);
+        drag += -out.forceLocal.dot(flow);
+      }
+      drag += 0.5 * rho * Vq * Vq * (this.frontalArea || 0) * 0.13;
+      return Math.max(0, drag);
+    };
+    const trimV2 = this._solveTrimSpeed(dragAtAlpha);
+    if (Number.isFinite(trimV2) && trimV2 > 30) V = trimV2;
+    qRef = 0.5 * rho * V * V;
+    // 迎角再迭代一次（速度变了，动压变了）
     for (let it = 0; it < 8; it++) {
+      const m = moments(ctlA, alpha);
+      const err = (needLift - m.lift) / (qRef * wingArea);
+      alpha = clamp(alpha + err * 0.16, -0.2, 0.5);
+    }
+    wingCL = (() => {
       const ca = Math.cos(alpha), sa = Math.sin(alpha);
       bv.set(0, -sa * V, -ca * V);
       let clSum = 0, areaSum = 0;
       for (const s of this.surfaces) {
         if (!s.isWing || s.detached) continue;
-        solveWing(s, bv, rho, ctlA, out);
+        solveWing(s, bv, rho, ctlA, out, 0);
         clSum += out.cl * s.area; areaSum += s.area;
       }
-      const cl = areaSum > 0 ? clSum / areaSum : 0;
-      wingCL = cl;
-      alpha = clamp(alpha + (need - cl) * 0.22, -0.2, 0.5);
-    }
+      return areaSum > 0 ? clSum / areaSum : 0;
+    })();
 
     /* ---------------- 1) 配平 ---------------- */
     const m0 = moments(ctlA, alpha);
@@ -460,7 +544,52 @@ export class Aircraft {
       roll: Math.abs(roll) < 0.005 ? 0 : roll,
       dampPitch, dampYaw, dampRoll,
       rollSlope, qRef, alpha, V,
+    };  }
+
+  /**
+   * 求解「满油门平飞时推力=阻力」的平衡速度（二分法）。
+   * 只对「常规动力」（喷气/螺旋桨/涡桨/电动）生效；纯火箭机返回 NaN —— 它们靠燃料
+   * 燃烧时段飞行，不存在气动平衡巡航点，沿用升力平衡速度即可。
+   * @param {(V:number)=>number} dragAt 给定速度的整机平飞阻力计算回调
+   * @returns {number} 平衡速度 m/s，无解时返回 NaN
+   * @private
+   */
+  _solveTrimSpeed(dragAt) {
+    if (!this.engines || !this.engines.length) return NaN;
+    if (!this.engines.some((e) => e.type !== 'rocket')) return NaN;
+    let T0 = 0, vMax = 300;
+    for (const e of this.engines) {
+      if (e.type === 'rocket') continue;
+      T0 += e.spec.staticThrust || e.spec.thrust || ((e.spec.power || 90000) / 32);
+      vMax = Math.max(vMax, e.spec.vMax || 300);
+    }
+    if (!(T0 > 0)) return NaN;
+    // 给定速度下的可用推力（与 update() 同口径，含 2000m 巡航密度的 densRatio）
+    const densRatio = 1.103 / 1.225;
+    const thrustAt = (V) => {
+      let T = 0;
+      for (const e of this.engines) {
+        if (e.type === 'rocket') continue;
+        const vAlong = -V;                            // 推力沿 -Z
+        if (e.type === 'jet') {
+          T += (e.spec.staticThrust || e.spec.thrust || 20000) * densRatio
+            * Math.max(0, 1 - clamp01(Math.abs(vAlong) / (e.spec.vMax || 330)) * 0.85);
+        } else {
+          const st0 = e.spec.staticThrust || (e.spec.power || 90000) / 32;
+          T += st0 * densRatio * Math.max(0, 1 - Math.abs(vAlong) / (e.spec.vMax || 100));
+        }
+      }
+      return T;
     };
+    // 净推力 f(V) = T(V) - D(V)，在关注区间内单调递减
+    let lo = 20, hi = Math.min(vMax * 1.2, 400);
+    if (thrustAt(lo) - dragAt(lo) <= 0) return NaN;   // 推重比太低，地面都起不来
+    if (thrustAt(hi) - dragAt(hi) > 0) return NaN;    // 到 hi 仍在加速，区间内无平衡点
+    for (let i = 0; i < 36; i++) {
+      const mid = 0.5 * (lo + hi);
+      if (thrustAt(mid) - dragAt(mid) > 0) lo = mid; else hi = mid;
+    }
+    return 0.5 * (lo + hi);
   }
 
   /**
@@ -643,12 +772,20 @@ export class Aircraft {
       flap: c.flaps, airbrake: c.airbrake,
     };
     const bodyVel = _bv;
+    // 机体真实侧滑角 β = atan2(横向分量, 前向分量)，由「气流速度相对机体」得出。
+    // 垂尾的侧向力由它驱动 —— 不能用「翼面局部展向流」代替，否则正常抬头时
+    // 机体 Y 方向的迎角分量会被当成侧滑，垂尾凭空产生竖直力（详见 physics.solveWing）。
+    let betaNow = 0;
+    {
+      _bv.copy(_v).applyQuaternion(_q.copy(body.quaternion).invert());   // 气流 -> 机体轴
+      if (Math.abs(_bv.z) > 1) betaNow = Math.atan2(_bv.x, Math.abs(_bv.z));
+    }
     const solveOne = (s, downwash) => {
       if (s.detached) return null;
       s.alphaOffset = downwash + (s.incidence || 0);
       body.bodyVelocityAt(s.position, bodyVel);
       bodyVel.sub(_v5.copy(wind).applyQuaternion(_q.copy(body.quaternion).invert()));
-      const res = solveWing(s, bodyVel, density, ctl, this._wingOut);
+      const res = solveWing(s, bodyVel, density, ctl, this._wingOut, betaNow);
       if (res.stall) stalled = true;
       const fw = _v2.copy(res.forceLocal).applyQuaternion(body.quaternion);
       const wp = _v3.copy(s.position).applyQuaternion(body.quaternion).add(body.position);
@@ -716,13 +853,21 @@ export class Aircraft {
       const densRatio = density / 1.225;
       switch (e.type) {
         case 'jet': {
-          const ram = 1 + clamp(vAlong / 340, -0.15, 0.6) * 0.30;
-          const fade = 1 - clamp01(Math.abs(vAlong) / (e.spec.vMax || 360)) * 0.35;
-          T = (e.spec.staticThrust || e.spec.thrust || 20000) * e.rpm01 * densRatio * ram * fade * e.health01;
+          // 涡喷/涡扇的可用推力随飞行速度明显下降：来流速度越高，进气道压缩比越高，
+          // 喷嘴可用温比越小，推力衰减越快（真实涡扇在 Ma0.9 巡航时可用推力约为静态的
+          // 40~55%）。旧模型 |v|/vMax*0.35 在 360m/s 只掉 35%，等于「空气越薄越有力」，
+          // 结果满油门时飞机一路加速到设计速度的 2~3 倍，配平彻底失效（实测 Simple Jet
+          // 平衡点 230m/s、Warhound 200m/s，而设计速度只有 88/73m/s）。
+          // 现改为统一口径的「到 vMax 衰减到 0」模型，与螺旋桨保持一致直觉：
+          //   T = T0 · ρ比 · (1 - k·V/Vmax)，k=0.85 → Vmax 时仅剩 15%
+          const vMax = e.spec.vMax || 360;
+          const fade = Math.max(0, 1 - clamp01(Math.abs(vAlong) / vMax) * 0.85);
+          T = (e.spec.staticThrust || e.spec.thrust || 20000) * e.rpm01 * densRatio * fade * e.health01;
           break;
         }
         case 'rocket': {
-          T = (e.spec.thrust || 24000) * c.throttle * e.health01 * (1 - clamp01(Math.abs(vAlong) / (e.spec.vMax || 400)) * 0.2);
+          // 火箭发动机推力与速度几乎无关（自带氧化剂，无进气道损失），只做微弱修正
+          T = (e.spec.thrust || 24000) * c.throttle * e.health01 * (1 - clamp01(Math.abs(vAlong) / (e.spec.vMax || 400)) * 0.1);
           break;
         }
         case 'prop': case 'turboprop': case 'electric': {
@@ -902,27 +1047,86 @@ export class Aircraft {
     const body = this.body;
     const a = this.assist;
     const e = _e.setFromQuaternion(body.quaternion, 'YXZ');
+    const s = this.state;
+    /* --- 起飞/低速阶段：飞行员拥有完全俯仰权限（真实电传的起飞直接律） --- */
+    // 现象：抬轮瞬间飞机离地后 groundContact 立刻变 false，辅助恢复到全强度，
+    // 16° 以上的俯仰被当成「超限」强行压回，飞机刚离地就被砸回跑道，随后
+    // 再也抬不起头、只能贴地无限加速（实测 Warhound 抬到 20° 后 2s 内被压到 -12°）。
+    // 真实飞机的起飞阶段由飞行员直接操纵，增稳系统不干预俯仰通道。
+    const agl = s.altitudeAGL ?? (s.altitudeASL || 0);
+    const lowAlt = agl < 60;
+    const takeoffPhase = lowAlt && s.speed > 8 && (this.controls.pitch > 0.2 || e.x > 0.12);
     let level = a * 0.9;
     // 姿态稳定（把机翼放平）
     if (this.groundContact) level = a * 0.2;
+    else if (lowAlt) level = a * 0.45;                 // 低空渐进，避免起飞瞬间硬介入
+    if (takeoffPhase) level *= 0.25;                   // 起飞抬轮：只留 25% 滚转保持
     const rollErr = e.z; // 期望 0
-    const pitchErr = e.x - clamp(e.x, -0.28, 0.28); // 允许 ±16° 自由俯仰
     const wl = body.angularVelocity.clone().applyQuaternion(_q.copy(body.quaternion).invert());
     // 只在玩家没有主动输入对应通道时介入（俯仰输入不应关掉滚转保持）
     const freeRoll = 1 - Math.min(1, Math.abs(this.controls.roll));
-    const freePitch = 1 - Math.min(1, Math.abs(this.controls.pitch));
-    const kpR = 1.2 * level * freeRoll, kdR = 0.55 * level * freeRoll;
-    const kpP = 1.2 * level * freePitch, kdP = 0.55 * level * freePitch;
+    const freePitch = takeoffPhase ? 0 : 1 - Math.min(1, Math.abs(this.controls.pitch));
     const I = body.inertia;
-    // 辅助增益：足够把「缓慢螺旋」压住（真实飞机靠飞行员不停修正，这里交给电传）
-    const tx = -(pitchErr * kpP * I.x * 0.9 + wl.x * kdP * I.x * 1.2);
-    const tz = -(rollErr * kpR * I.z * 1.6 + wl.z * kdR * I.z * 1.6);
+
+    /* --- 姿态保持 + 长周期(phugoid)抑制 --- */
+    // 现象：固定 pitchTrim 只在该机型设计速度下力矩为零。油量/推力/重量一变，
+    // 飞机就自己加速或减速，长周期(phugoid)上表现为松手后持续爬升或掉高
+    // （实测 Simple Jet 松手 20s 爬 364m、Warhound 爬 1235m 并翻转）。
+    // 静稳定只保证「迎角扰动会恢复」，管不了长周期；这里补两路反馈：
+    //   1) 姿态保持：俯仰角偏离「配平俯仰角」超过包线时柔和回中
+    //   2) 长周期阻尼：走能量法（见下方注释），抑制速度/高度的缓慢交换
+    // 注意 pitchErr 的符号语义：**正值 = 需要低头**（沿用旧实现的约定，
+    // 因为 tx 前面有负号）。俯仰回中的目标不是「水平 0°」而是「当前配平俯仰角」
+    // ——平飞时机头本就带着迎角（低速机可达 8~12°），以 0° 为目标会把飞机按成俯冲。
+    // 低空/起飞阶段豁免：那段完全交给飞行员。
+    const trimPitch = this.trimPitchAngle || 0;
+    const limit = takeoffPhase ? 1.2 : (lowAlt ? 0.62 : 0.09);
+    const dev = e.x - trimPitch;
+    const over = Math.abs(dev) - limit;
+    const softErr = over > 0 ? Math.tanh(over / 0.18) * Math.sign(dev) * 0.22 : 0;
+    // 长周期(phugoid)抑制 —— 「能量法」，注意符号：
+    //   phugoid 下降段 = 掉高 + 加速（动能增加、势能减少）；上升段 = 爬升 + 减速。
+    // 要抑制振荡必须「把动能换回势能」：空速高于配平 -> 抬头（用速度换高度），
+    // 空速低于配平 -> 低头。这与「速度高就低头」的直觉相反，但后者恰好是 phugoid
+    // 的正反馈（低头 -> 更掉高 -> 更加速 -> 更低头）。同时叠加垂直速度阻尼：
+    // 下沉时抬头、上冲时低头，让残余振荡更快衰减。
+    let pitchBiasLow = 0;
+    if (!takeoffPhase && !lowAlt && s.speed > 12 && this.designV > 20 && !this.groundContact && !s.stalled) {
+      const thr = clamp01(this.controls.throttle);
+      // 参考速度：满油门时为 designV（推力=阻力平衡点），收油门时按平方律下调
+      // （真实飞机阻力 ∝ V²，油门减半后平衡速度 ≈ 0.55~0.7 倍）。用 0.62 常数，
+      // 比线性的 0.55 更贴近平方律，收油门后不会把飞机逼得太慢。
+      const vRef = this.designV * (0.62 + 0.38 * thr);
+      const err = clamp((s.speed - vRef) / Math.max(14, vRef * 0.5), -1, 1);
+      const vs = clamp((s.verticalSpeed ?? 0) / 30, -1, 1);
+      // 垂速积分项：消除「速度锁死但一直缓慢下沉」的稳态误差。
+      // 纯比例项下，飞机可以停在一个「垂速恒定、比例出力刚好抵消」的悬停点上
+      // （实测 Warhound 稳定在 -4.4° / 12m/s 下沉率，怎么都不回平）。积分把这段
+      // 残余垂速慢慢累积成抬头偏置，直到真正回到水平。限幅 ±1，避免积分饱和。
+      this._vsInteg = clamp((this._vsInteg || 0) + vs * dt * 0.6, -1, 1);
+      const upBias = err * 0.9 - vs * 2.2 - this._vsInteg * 1.1;
+      pitchBiasLow = -upBias * 0.90 * freePitch;
+    } else {
+      this._vsInteg = 0;
+    }
+    const pitchErr = softErr + Math.tanh(pitchBiasLow / 0.16) * 0.16;
+    // 辅助增益：直接按「期望闭环固有频率 ωn / 阻尼比 ζ」标定，而不是拍脑袋系数。
+    // 旧实现 tx = -(pitchErr*kp*I.x*0.9 + wl.x*kd*I.x*1.2)，实际只有 ~700 N·m，
+    // 而短周期阻尼力矩在 ω=0.1rad/s 时就有上万 N·m，辅助被彻底淹没
+    // （实测松手后俯仰一路漂到 -15.7°、掉高 900m，辅助形同虚设）。
+    // 取 ωn = 1.3 rad/s、ζ = 0.85 —— 比短周期(2~6 rad/s)慢一档，不抢手感，
+    // 但足以把长周期(phugoid)的俯仰漂移拉回来。
+    const wn = 1.3, zeta = 0.85;
+    const kP = wn * wn * I.x, kD = 2 * zeta * wn * I.x;
+    const tx = -(pitchErr * kP + wl.x * kD) * level * freePitch;
+    const tz = -(rollErr * wn * wn * I.z + wl.z * 1.8 * wn * I.z) * level * freeRoll;
     // 机体坐标 -> 世界坐标（刚体力矩是世界系的，直接给机体系分量会随姿态跑偏）
     body.applyTorque(_v4.set(tx, 0, tz).applyQuaternion(body.quaternion));
-    // 迎角保护：明显超过限制时给一个低头力矩（真实电传的 α 限制器），平时不介入
-    const s = this.state;
+    // 迎角保护：明显超过限制时给一个低头力矩（真实电传的 α 限制器）。
+    // 只在离地足够高、且玩家没有主动拉杆时介入 —— 起飞/着陆阶段飞行员权限优先，
+    // 否则抬轮瞬间的大迎角会被立刻压掉，飞机永远离不了地。
     const aoaLimit = 0.34;
-    if (a > 0.3 && s.aoa > aoaLimit && s.speed > 25) {
+    if (a > 0.3 && !lowAlt && !takeoffPhase && s.aoa > aoaLimit && s.speed > 25) {
       const excess = clamp01((s.aoa - aoaLimit) / 0.3);
       body.applyTorque(_v4.set(-excess * I.x * 0.6 * a, 0, 0).applyQuaternion(body.quaternion));
     }

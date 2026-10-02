@@ -98,7 +98,8 @@ export const MAPS = [
     desc: '漂浮在云海上的白色城市与公园岛，热气球与观景平台点缀其间。',
     music: 'city', timeOfDay: 0.30, weather: 'none', cloudiness: 0.6,
     unlockCost: 0, tags: ['城市', '观光'],
-    flatRegions: [{ name: 'main', x: 0, z: -900, radius: 330, height: 210, heading: 0 }],
+    // fixed: 同 stratos —— 天空公园是悬浮城市，出生平台抬高到 210m 才有「云海之上」的观感
+    flatRegions: [{ name: 'main', x: 0, z: -900, radius: 330, height: 210, heading: 0, fixed: true }],
     missions: [
       { mode: 'free' },
       { mode: 'race', rings: 10, laps: 2 },
@@ -203,7 +204,9 @@ export const MAPS = [
     desc: '万米之上的浮空岛群与巨型飞艇。空气稀薄，小心失速。',
     music: 'flight', timeOfDay: 0.48, weather: 'none', cloudiness: 0.8,
     unlockCost: 0, tags: ['高空', '浮空岛', '挑战'],
-    flatRegions: [{ name: 'main', x: 0, z: -2200, radius: 360, height: 1600, heading: 0 }],
+    // fixed: 浮空岛图，主岛/出生平台刻意悬在云海之上（landmarks 的浮岛按 seaLevel+N 独立建造），
+    // 不能被地形自动平整逻辑拉回地面，否则玩家出生点会掉到海面、与浮岛差出 800m
+    flatRegions: [{ name: 'main', x: 0, z: -2200, radius: 360, height: 1600, heading: 0, fixed: true }],
     missions: [
       { mode: 'free' },
       { mode: 'race', rings: 16, laps: 1 },

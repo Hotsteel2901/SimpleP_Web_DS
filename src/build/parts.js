@@ -346,7 +346,15 @@ export const PART_DEFS = {
       parts.push(inner);
       return parts;
     },
-    engine: (s, p) => { const t = 26000 * (p.power ?? 1); return { type: 'jet', thrust: t, staticThrust: t, vMax: 360, maxRpm: 1, fuelRate: 0.02 * (p.power ?? 1) }; },
+    // 静态推力标定：原 26000N 对标真实 J85 涡喷(12.7kN)的两倍，导致常规喷气机
+    // 推重比高达 1.4~2.0（实测 Warhound 2.03），满油门平衡速度冲到 175~200m/s，
+    // 远超设计巡航速度(73~88m/s)，配平在高速区完全失效 → 「松手就爬升/掉高」。
+    // 实测最合理的一点：静态推力取 11000N，vMax 330（Ma0.97 海平面），
+    // 常规喷气机平衡速度落到 110~130m/s，与设计速度同量级，长周期可收敛。
+    // vMax 330 -> 300：让推力曲线在平衡点附近更陡，长周期的恢复力更强。
+    // 涡喷在平衡点附近若 T/D 曲线太平（推力随速度变化小），速度一扰动就回不来，
+    // 表现为「松手后慢慢加速、越飞越低」（实测 Warhound 30s 掉高 345m）。
+    engine: (s, p) => { const t = 11000 * (p.power ?? 1); return { type: 'jet', thrust: t, staticThrust: t, vMax: 300, maxRpm: 1, fuelRate: 0.02 * (p.power ?? 1) }; },
   },
   engine_turboprop: {
     id: 'engine_turboprop', name: '涡桨发动机', cat: 'power', size: [0.9, 0.9, 2.0], mass: 260, cost: 4400, hp: 140, color: 0x39424e,

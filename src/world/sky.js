@@ -247,6 +247,33 @@ export class SkyDome {
     return k;
   }
 
+  /**
+   * 依据当前天空配色重建环境贴图（IBL）。
+   * 用一张等距柱状（equirect）渐变贴图过 PMREM，得到粗糙度预滤的辐射环境：
+   * 金属/玻璃才有方向性的反射，而不是靠纯色硬凑。
+   * 时间变化不大时跳过（阈值 0.01），避免拖时间滑块时每帧重建。
+   */
+  _updateEnv(k) {
+    if (!this.pmrem) return;
+    if (this._envT >= 0 && Math.abs(this.timeOfDay - this._envT) < 0.01) return;
+    const tex = makeSkyTexture(k.top.getHex(), k.hor.getHex(), k.bot.getHex());
+    if (!tex) return;
+    tex.mapping = THREE.EquirectangularReflectionMapping;
+    let rt = null;
+    try {
+      rt = this.pmrem.fromEquirectangular(tex);
+    } catch {
+      rt = null;
+    }
+    tex.dispose();
+    if (!rt) return;
+    this.envRT?.dispose();
+    this.envRT = rt;
+    this.scene.environment = rt.texture;
+    if ('environmentIntensity' in this.scene) this.scene.environmentIntensity = 0.35 + k.amb * 0.65;
+    this._envT = this.timeOfDay;
+  }
+
   /** 每帧：太阳阴影跟随相机、云层漂移 */
   update(dt, camera, focus) {
     this.uniforms.uTime.value += dt;
@@ -277,6 +304,9 @@ export class SkyDome {
     this.cloudLayer2?.geometry.dispose(); this.cloudLayer2?.material.dispose();
     this.cloudTex?.dispose(); this.cloudTex2?.dispose();
     this.hemi.removeFromParent(); this.sun.removeFromParent(); this.fill.removeFromParent();
+    if (this.scene?.environment === this.envRT?.texture) this.scene.environment = null;
+    this.envRT?.dispose();
+    this.pmrem?.dispose();
   }
 }
 
