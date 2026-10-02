@@ -187,15 +187,19 @@ export function makePanelTextures(size = 512, seed = 20251) {
   const g = ctx2d(c), gn = ctx2d(cn), gr = ctx2d(cr);
   if (!g || !gn || !gr) return { map: null, normalMap: null, roughnessMap: null };
   const rng = makeRng(seed);
-  // ---- 高度场：蒙皮拼缝（凹槽 = 负）+ 铆钉（小凸起）+ 大块蒙皮起伏 ----
+  // ---- 高度场：蒙皮拼缝（凹槽 = 负）+ 铆钉（小凸起）+ 轻微蒙皮起伏 ----
   const H = new Float32Array(size * size);
   for (let i = 0; i < H.length; i++) H[i] = (rng() - 0.5) * 0.06;      // 细噪声
   const px = (x, y, v) => { if (x >= 0 && y >= 0 && x < size && y < size) H[y * size + x] += v; };
-  // 大块蒙皮：低频起伏
+  // 大块蒙皮起伏：必须「高频 + 低幅度」。
+  // 早期版本用了 ~300px 波长、幅度 0.10 的正弦，经 0.82+h*1.15 着色后
+  // 行均值波动高达 98/255（≈39% 亮度调制）—— 大面积机翼贴上去就像水波纹。
+  // 现在换成短波长（~40px）、极小幅度，只保留一点「蒙皮不是纯平面」的质感，
+  // 真正的尺度感交给拼缝与铆钉（那才是让人读出「金属蒙皮」的东西）。
   for (let y = 0; y < size; y++) {
     for (let x = 0; x < size; x++) {
-      const big = Math.sin(x * 0.021 + Math.sin(y * 0.017) * 2.1) * Math.cos(y * 0.019 + Math.sin(x * 0.013) * 1.7);
-      H[y * size + x] += big * 0.10;
+      const big = Math.sin(x * 0.15 + Math.sin(y * 0.11) * 1.3) * Math.cos(y * 0.13 + Math.sin(x * 0.09) * 1.1);
+      H[y * size + x] += big * 0.018;
     }
   }
   // 蒙皮拼缝：纵向 + 横向若干条（宽度 2px 的凹槽，两侧有轻微凸起）
@@ -239,8 +243,9 @@ export function makePanelTextures(size = 512, seed = 20251) {
     for (let x = 0; x < size; x++) {
       const i = (y * size + x) * 4;
       const h = H[y * size + x];
-      // 颜色：凹槽变暗，凸起微亮（其余保持近白，交给 material.color 染色）
-      const shade = clamp(0.82 + h * 1.15, 0.5, 1.12);
+      // 颜色：凹槽变暗，凸起微亮（其余保持近白，交给 material.color 染色）。
+      // 系数 1.15 会把拼缝拉成很深的黑线；降到 0.75 后拼缝仍清晰，但不再"沟壑感"。
+      const shade = clamp(0.90 + h * 0.75, 0.62, 1.06);
       const v = shade * 255;
       img.data[i] = img.data[i + 1] = img.data[i + 2] = v; img.data[i + 3] = 255;
       // 粗糙度：拼缝/口盖更粗糙（积灰），大面稍光滑
