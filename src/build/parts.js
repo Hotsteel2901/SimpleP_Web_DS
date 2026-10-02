@@ -7,7 +7,7 @@
  * 约定：机头朝 -Z，Y 向上。
  */
 import * as THREE from 'three';
-import { clamp, DEG, makePaintTexture, makeWindowTexture } from '../core/util.js';
+import { clamp, DEG, makePaintTexture, makeWindowTexture, makePanelTextures } from '../core/util.js';
 
 /* ================================================================== 分类 */
 export const CATEGORIES = [
@@ -24,7 +24,13 @@ export const CATEGORIES = [
 
 /* ================================================================== 材质缓存 */
 const matCache = new Map();
-/** 取得（并缓存）一个标准材质。opts: {color, metalness, roughness, emissive, opacity, map} */
+/** 蒙皮细节贴图（全局共享一套，用 material.color 染色 —— 几十种涂装只占一份显存） */
+let _panel = null;
+export function panelTextures() {
+  if (_panel === null) _panel = makePanelTextures(512) || { map: null, normalMap: null, roughnessMap: null };
+  return _panel;
+}
+/** 取得（并缓存）一个标准材质。opts: {color, metalness, roughness, emissive, opacity, map, detail} */
 export function getMaterial(opts = {}) {
   const key = JSON.stringify(opts);
   if (matCache.has(key)) return matCache.get(key);
@@ -40,13 +46,51 @@ export function getMaterial(opts = {}) {
     flatShading: !!opts.flat,
   });
   if (opts.opacity != null && opts.opacity < 1) m.depthWrite = false;
+  // 蒙皮细节：拼缝/铆钉/口盖的法线 + 粗糙度 + 微暗线，平面色块立刻有「金属蒙皮」的清晰度
+  if (opts.detail) {
+    const p = panelTextures();
+    if (p.map) {
+      m.map = p.map;
+      m.normalMap = p.normalMap;
+      m.roughnessMap = p.roughnessMap;
+      m.normalScale.set(0.55, 0.55);
+      m.envMapIntensity = 1.15;
+    }
+  }
   matCache.set(key, m);
   return m;
 }
-export function clearMaterialCache() { matCache.forEach((m) => m.dispose()); matCache.clear(); }
+export function clearMaterialCache() {
+  matCache.forEach((m) => m.dispose());
+  matCache.clear();
+  if (_panel) { _panel.map?.dispose(); _panel.normalMap?.dispose(); _panel.roughnessMap?.dispose(); _panel = null; }
+}
 
 /* ================================================================== 几何工具 */
 const box = (w, h, l) => new THREE.BoxGeometry(w, h, l);
+
+/**
+ * 把 UV 缩放到「蒙皮细节贴图」的物理尺度（约 2.2m 一格）。
+ * 不这么做的话，13m 的货机机翼和 1m 的方向舵用的是同一块 0~1 UV，
+ * 拼缝密度差 10 倍 —— 看着就是「贴图糊/不一致」。BoxGeometry 按面分别缩放。
+ */
+export function fitUV(geo, size, tile = 2.2) {
+  const uv = geo?.attributes?.uv; if (!uv) return geo;
+  const [w, h, l] = size;
+  if (geo.type === 'BoxGeometry') {
+    // BoxGeometry：每面 4 个顶点，顺序 +X,-X,+Y,-Y,+Z,-Z
+    const dims = [[l, h], [l, h], [w, l], [w, l], [w, h], [w, h]];
+    for (let f = 0; f < 6; f++) {
+      const su = dims[f][0] / tile, sv = dims[f][1] / tile;
+      for (let i = f * 4; i < f * 4 + 4 && i < uv.count; i++) uv.setXY(i, uv.getX(i) * su, uv.getY(i) * sv);
+    }
+  } else {
+    const su = Math.max(w, l) / tile, sv = Math.max(h, l) / tile;
+    for (let i = 0; i < uv.count; i++) uv.setXY(i, uv.getX(i) * su, uv.getY(i) * sv);
+  }
+  uv.needsUpdate = true;
+  return geo;
+}
 
 /** NACA 四位翼型轮廓（x: 0..1 弦向，返回 {x,y} 上半/下半） */
 function nacaProfile(thick = 0.12, camber = 0.02, camberPos = 0.4, steps = 14) {
@@ -66,7 +110,13 @@ function nacaProfile(thick = 0.12, camber = 0.02, camberPos = 0.4, steps = 14) {
 
 /**
  * 生成一片机翼/尾翼（NACA 翼型挤出）。
- * @returns {THREE.BufferGeometry} 弦向沿 Z、展向沿 X、厚度沿 Y
+ *
+ * 机体坐标约定（机头 -Z / 上 +Y / 右 +X），与飞行力学完全一致：
+ *   - 展向沿 X：±span/2，关于零件原点对称（一个零件 = 一整片翼）
+ *   - 弦向沿 Z：前缘在 -chord/2、后缘在 +chord/2，弦中心正好落在零件原点
+ *   - 厚度沿 Y，弯度朝上（零迎角即产生升力）
+ *   - 后掠取正值时翼尖向后（+Z）移动；上反角让翼尖向上
+ * @returns {THREE.BufferGeometry}
  */
 export function wingGeometry(span, chord, thick = 0.12, taper = 1, sweep = 0, dihedral = 0, camber = 0.02) {
   const { top, bot } = nacaProfile(thick, camber);
@@ -78,15 +128,15 @@ export function wingGeometry(span, chord, thick = 0.12, taper = 1, sweep = 0, di
   const geo = new THREE.ExtrudeGeometry(shape, { depth: span, bevelEnabled: false, curveSegments: 2 });
   geo.translate(0, 0, -span / 2);
   geo.scale(chord, chord, 1);
-  geo.rotateY(Math.PI / 2); // 弦向 -> Z, 展向 -> X
-  geo.translate(0, 0, -chord * 0.25); // 气动中心大致在 25% 弦
+  geo.rotateY(-Math.PI / 2);            // 弦向 x(0=前缘) -> +Z，展向 -> X
+  geo.translate(0, 0, -chord * 0.5);    // 让弦中心落在零件原点（前缘 -c/2 / 后缘 +c/2）
   // 后掠 / 上反角 / 收缩：按展向位置变形顶点
   const pos = geo.attributes.position;
   for (let i = 0; i < pos.count; i++) {
     const x = pos.getX(i), y = pos.getY(i), z = pos.getZ(i);
     const s = span > 1e-6 ? Math.abs(x) / (span / 2) : 0; // 0 根部 -> 1 翼尖
     const taperF = 1 - (1 - taper) * s;
-    const nz = z * taperF - sweep * s * (x >= 0 ? 1 : 1);
+    const nz = z * taperF + sweep * s;   // 正后掠 = 翼尖向后
     const ny = y + Math.tan(dihedral * DEG) * Math.abs(x);
     pos.setXYZ(i, x, ny, nz);
   }
@@ -208,7 +258,8 @@ export const PART_DEFS = {
       { key: 'thick', label: '翼型厚度', min: 0.06, max: 0.2, step: 0.01, default: 0.12 },
     ],
     geo: (s, p) => wingGeometry(s[0], s[2], p.thick ?? 0.12, p.taper ?? 0.6, p.sweep ?? 0.5, 0, 0),
-    aero: (s, p) => ({ type: 'wing', span: s[0], chord: s[2], area: s[0] * s[2] * (1 + (p.taper ?? 0.6)) / 2, cd0: 0.014, thick: p.thick ?? 0.12, taper: p.taper ?? 0.6, sweep: p.sweep ?? 0.5, dihedral: 0, control: 'elevator' }),
+    // incidence：尾翼安装角略负（真实飞机如此），保证巡航时尾翼产生下压配平力矩
+    aero: (s, p) => ({ type: 'wing', span: s[0], chord: s[2], area: s[0] * s[2] * (1 + (p.taper ?? 0.6)) / 2, cd0: 0.014, thick: p.thick ?? 0.12, taper: p.taper ?? 0.6, sweep: p.sweep ?? 0.5, dihedral: 0, control: 'elevator', incidence: -2 }),
     surface: { chordFrac: 0.35, spanFrac: 0.95, type: 'elevator' },
   },
   fin: {
@@ -229,7 +280,8 @@ export const PART_DEFS = {
       { key: 'sweep', label: '后掠', min: 0, max: 2, step: 0.1, default: 1.0 },
     ],
     geo: (s, p) => wingGeometry(s[0], s[2], 0.1, p.taper ?? 0.6, p.sweep ?? 1.0, 0, 0.02),
-    aero: (s, p) => ({ type: 'wing', span: s[0], chord: s[2], area: s[0] * s[2] * 0.8, cd0: 0.014, thick: 0.1, taper: p.taper ?? 0.6, sweep: p.sweep ?? 1.0, dihedral: 0, control: 'elevator' }),
+    // 鸭翼安装角略正（前翼先于主翼失速，天然防深失速）
+    aero: (s, p) => ({ type: 'wing', span: s[0], chord: s[2], area: s[0] * s[2] * 0.8, cd0: 0.014, thick: 0.1, taper: p.taper ?? 0.6, sweep: p.sweep ?? 1.0, dihedral: 0, control: 'elevator', incidence: 1.5 }),
     surface: { chordFrac: 0.32, spanFrac: 0.9, type: 'elevator' },
   },
 
@@ -294,7 +346,15 @@ export const PART_DEFS = {
       parts.push(inner);
       return parts;
     },
-    engine: (s, p) => { const t = 26000 * (p.power ?? 1); return { type: 'jet', thrust: t, staticThrust: t, vMax: 360, maxRpm: 1, fuelRate: 0.02 * (p.power ?? 1) }; },
+    // 静态推力标定：原 26000N 对标真实 J85 涡喷(12.7kN)的两倍，导致常规喷气机
+    // 推重比高达 1.4~2.0（实测 Warhound 2.03），满油门平衡速度冲到 175~200m/s，
+    // 远超设计巡航速度(73~88m/s)，配平在高速区完全失效 → 「松手就爬升/掉高」。
+    // 实测最合理的一点：静态推力取 11000N，vMax 330（Ma0.97 海平面），
+    // 常规喷气机平衡速度落到 110~130m/s，与设计速度同量级，长周期可收敛。
+    // vMax 330 -> 300：让推力曲线在平衡点附近更陡，长周期的恢复力更强。
+    // 涡喷在平衡点附近若 T/D 曲线太平（推力随速度变化小），速度一扰动就回不来，
+    // 表现为「松手后慢慢加速、越飞越低」（实测 Warhound 30s 掉高 345m）。
+    engine: (s, p) => { const t = 11000 * (p.power ?? 1); return { type: 'jet', thrust: t, staticThrust: t, vMax: 300, maxRpm: 1, fuelRate: 0.02 * (p.power ?? 1) }; },
   },
   engine_turboprop: {
     id: 'engine_turboprop', name: '涡桨发动机', cat: 'power', size: [0.9, 0.9, 2.0], mass: 260, cost: 4400, hp: 140, color: 0x39424e,
@@ -567,19 +627,22 @@ export function buildPartMesh(part, opts = {}) {
   if (!Array.isArray(geos)) geos = [geos];
 
   const color = new THREE.Color(part.color || '#c9d3dd');
+  const detailOn = opts.detail !== false;
   geos.forEach((g, i) => {
     if (!g) return;
+    if (detailOn) fitUV(g, part.size);
     let mat;
     if (d.glassIndex === i) {
-      mat = getMaterial({ color: 0x88c4e0, metalness: 0.1, roughness: 0.05, opacity: 0.4, side: THREE.DoubleSide });
+      // 座舱玻璃：高反射 + 低粗糙，配合环境贴图才像玻璃而不是蓝塑料
+      mat = getMaterial({ color: 0x9ec8e8, metalness: 0.9, roughness: 0.04, opacity: 0.42, side: THREE.DoubleSide });
     } else if (d.light && i === 0) {
-      mat = new THREE.MeshStandardMaterial({ color: color, emissive: color, emissiveIntensity: 2.2, metalness: 0.2, roughness: 0.3 });
+      mat = new THREE.MeshStandardMaterial({ color: color, emissive: color, emissiveIntensity: 2.6, metalness: 0.2, roughness: 0.25 });
     } else if (d.isPropeller && i > 0) {
-      mat = getMaterial({ color: 0x1c2026, metalness: 0.5, roughness: 0.4 });
+      mat = getMaterial({ color: 0x1c2026, metalness: 0.5, roughness: 0.35, detail: detailOn });
     } else if (opts.painted !== false) {
-      mat = getMaterial({ color: color.getHex(), metalness: 0.42, roughness: 0.42 });
+      mat = getMaterial({ color: color.getHex(), metalness: 0.42, roughness: 0.4, detail: detailOn });
     } else {
-      mat = getMaterial({ color: 0xbfc7cf, metalness: 0.6, roughness: 0.4 });
+      mat = getMaterial({ color: 0xbfc7cf, metalness: 0.6, roughness: 0.38, detail: detailOn });
     }
     const mesh = new THREE.Mesh(g, mat);
     mesh.castShadow = opts.shadows !== false;
@@ -609,21 +672,46 @@ export function partFeatures(part) {
   };
 }
 
-/** 渲染机翼的可动控制面（视觉），返回 { mesh, axis, hinge } 或 null */
-export function buildControlSurface(part) {
+/**
+ * 渲染可动控制面（视觉）：返回铰链 Group 数组（副翼/升降舵可能是左右两块）。
+ *
+ * 摆放规则（与 wingGeometry 的坐标约定一致）：
+ *   - 铰链线在控制面前缘（= 翼面后缘往前 chordFrac*c）
+ *   - 主翼的副翼/升降副翼分左右两块，各占单侧展长的 35%（真实布局）
+ *   - 方向舵做成竖直面，绕 Y 轴偏转
+ */
+export function buildControlSurfaces(part) {
   const d = PART_DEFS[part.def];
-  if (!d?.surface) return null;
+  if (!d?.surface) return [];
   const { chordFrac, spanFrac, type } = d.surface;
-  const span = part.size[0] * spanFrac, chord = part.size[2] * chordFrac;
-  const isVertical = type === 'rudder';
-  const geo = wingGeometry(span, chord, 0.12, 0.9, 0, 0, 0.01);
-  const mat = getMaterial({ color: new THREE.Color(part.color || '#cfd8e0').multiplyScalar(0.85).getHex(), metalness: 0.5, roughness: 0.4 });
-  const mesh = new THREE.Mesh(geo, mat);
-  // 铰链位于.75 弦处
-  const hinge = new THREE.Group();
-  mesh.position.z = part.size[2] * (0.5 - chordFrac / 2) - part.size[2] * 0.25;
-  hinge.add(mesh);
-  if (isVertical) hinge.rotation.y = Math.PI / 2;
-  hinge.userData.controlType = type;
-  return hinge;
+  const [w, , l] = part.size;
+  const vertical = (type === 'rudder');
+  const chord = l * chordFrac;
+  const zHinge = l * 0.5 - chord;                 // 铰链所在的 z（零件坐标）
+  const mat = getMaterial({ color: new THREE.Color(part.color || '#cfd8e0').multiplyScalar(0.85).getHex(), metalness: 0.5, roughness: 0.38, detail: true });
+
+  const mk = (centerX, span) => {
+    const geo = wingGeometry(Math.max(0.12, span), chord, 0.12, 0.9, 0, 0, 0.01);
+    fitUV(geo, [Math.max(0.12, span), 0.12, chord]);
+    if (vertical) geo.rotateZ(Math.PI / 2);        // 展向 -> Y（竖直舵面）
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.castShadow = true; mesh.receiveShadow = true;
+    mesh.position.set(0, 0, chord * 0.5);          // 相对铰链：向后再走半个控制面弦长
+    const hinge = new THREE.Group();
+    hinge.position.set(centerX, 0, zHinge);
+    hinge.add(mesh);
+    hinge.userData.controlType = type;
+    return hinge;
+  };
+
+  const out = [];
+  if (vertical || type === 'elevator' || type === 'flap') {
+    out.push(mk(0, w * spanFrac));                 // 整体一块（水平尾翼/襟翼/方向舵）
+  } else {
+    // 副翼 / 升降副翼：左右各一块，位于单侧展长的外侧 35%
+    const aLen = w * 0.175;
+    const cx = w * 0.5 - aLen * 0.5;
+    out.push(mk(cx, aLen), mk(-cx, aLen));
+  }
+  return out;
 }

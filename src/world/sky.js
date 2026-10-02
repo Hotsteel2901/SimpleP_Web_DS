@@ -5,7 +5,7 @@
  * 云层用一层平面贴图 + 若干广告牌云团。零外部资源。
  */
 import * as THREE from 'three';
-import { clamp, clamp01, lerp, smoothstep, makeRng } from '../core/util.js';
+import { clamp, clamp01, lerp, smoothstep, makeRng, makeSkyTexture } from '../core/util.js';
 
 /* ---------------------------------------------------------------- 色彩预设 */
 const KEYFRAMES = [
@@ -149,21 +149,33 @@ export class SkyDome {
     this.root.add(this.skyMesh);
 
     // 光照
+    this.scene = scene;
     this.hemi = new THREE.HemisphereLight(0xbcd9ff, 0x4a5a45, 0.6);
     scene.add(this.hemi);
     this.sun = new THREE.DirectionalLight(0xffffff, 2.0);
     this.sun.castShadow = !!opts.shadows;
     if (this.sun.castShadow) {
-      this.sun.shadow.mapSize.set(2048, 2048);
-      const d = opts.shadowDistance ?? 420;
+      // 阴影范围贴合跟随目标：范围越小，单位面积的阴影贴图分辨率越高（边缘越干净）
+      const quality = opts.quality ?? 1;
+      const res = quality >= 2 ? 4096 : quality >= 1 ? 2048 : 1024;
+      this.sun.shadow.mapSize.set(res, res);
+      const d = opts.shadowDistance ?? 260;
       this.sun.shadow.camera.left = -d; this.sun.shadow.camera.right = d;
       this.sun.shadow.camera.top = d; this.sun.shadow.camera.bottom = -d;
       this.sun.shadow.camera.near = 1; this.sun.shadow.camera.far = d * 4;
-      this.sun.shadow.bias = -0.0008;
-      this.sun.shadow.normalBias = 0.6;
+      this.sun.shadow.bias = -0.00035;
+      this.sun.shadow.normalBias = 0.35;
     }
     scene.add(this.sun);
     scene.add(this.sun.target);
+
+    // 环境贴图（IBL）：由天空渐变生成 PMREM，金属/玻璃才有真实反射
+    // —— 这是“材质清晰度”提升最明显的一步：没有它，金属反射只能用纯色近似
+    this.pmrem = (typeof THREE.PMREMGenerator === 'function' && opts.pmrem !== false)
+      ? new THREE.PMREMGenerator(opts.renderer || null)
+      : null;
+    this.envRT = null;
+    this._envT = -1;
 
     // 环境光（微弱补光，避免背光面纯黑）
     this.fill = new THREE.DirectionalLight(0x9fc4ff, 0.22);
@@ -224,14 +236,50 @@ export class SkyDome {
     this.sun.intensity = k.sunI;
     this.sun.position.copy(dir).multiplyScalar(1600);
     this.sun.target.position.set(0, 0, 0);
-    this.hemi.intensity = k.amb * 0.85 + 0.1;
+    this.hemi.intensity = k.amb * 0.7 + 0.08;
     this.hemi.color.copy(k.hor);
-    this.fill.intensity = 0.12 + k.amb * 0.2;
+    this.fill.intensity = 0.1 + k.amb * 0.16;
+    // IBL 是可选的锦上添花：即使生成失败（canvas/PMREM 不可用、贴图异常），
+    // 也绝不能让整个 loadWorld 挂掉 —— 否则游戏直接进不去。
+    try { this._updateEnv(k); } catch (e) { console.warn('[sky] 环境贴图生成失败，已跳过 IBL', e); this.pmrem = null; }
     // 雾颜色跟随地平线
     this.fog.color.copy(k.hor).lerp(k.bot, 0.25);
     this.fog.density = 0.000075 + (1 - Math.max(0, elev)) * 0.00007;
     this.isNight = k.star > 0.35;
     return k;
+  }
+
+  /**
+   * 依据当前天空配色重建环境贴图（IBL）。
+   * 用一张等距柱状（equirect）渐变贴图过 PMREM，得到粗糙度预滤的辐射环境：
+   * 金属/玻璃才有方向性的反射，而不是靠纯色硬凑。
+   * 时间变化不大时跳过（阈值 0.01），避免拖时间滑块时每帧重建。
+   */
+  _updateEnv(k) {
+    if (!this.pmrem) return;
+    if (this._envT >= 0 && Math.abs(this.timeOfDay - this._envT) < 0.01) return;
+    // 注意：makeSkyTexture 的入参是 CSS 颜色字符串（内部走 canvas addColorStop）。
+    // k.top/hor/bot 是 THREE.Color，必须用 getStyle()（'rgb(r,g,b)'）而不是
+    // getHex()（十进制数字，传给 addColorStop 会抛 SyntaxError 并中断整个世界加载）。
+    const tex = makeSkyTexture(k.top.getStyle(), k.hor.getStyle(), k.bot.getStyle());
+    if (!tex) return;
+    tex.mapping = THREE.EquirectangularReflectionMapping;
+    let rt = null;
+    try {
+      rt = this.pmrem.fromEquirectangular(tex);
+    } catch (e) {
+      // 不静默：IBL 失败会让金属/玻璃失去反射，是「材质清晰度」的关键项，
+      // 出问题必须能看见，否则又会像之前那样被 try/catch 掩盖。
+      console.warn('[sky] PMREM 预处理失败，本次跳过 IBL', e);
+      rt = null;
+    }
+    tex.dispose();
+    if (!rt) return;
+    this.envRT?.dispose();
+    this.envRT = rt;
+    this.scene.environment = rt.texture;
+    if ('environmentIntensity' in this.scene) this.scene.environmentIntensity = 0.35 + k.amb * 0.65;
+    this._envT = this.timeOfDay;
   }
 
   /** 每帧：太阳阴影跟随相机、云层漂移 */
@@ -264,6 +312,9 @@ export class SkyDome {
     this.cloudLayer2?.geometry.dispose(); this.cloudLayer2?.material.dispose();
     this.cloudTex?.dispose(); this.cloudTex2?.dispose();
     this.hemi.removeFromParent(); this.sun.removeFromParent(); this.fill.removeFromParent();
+    if (this.scene?.environment === this.envRT?.texture) this.scene.environment = null;
+    this.envRT?.dispose();
+    this.pmrem?.dispose();
   }
 }
 

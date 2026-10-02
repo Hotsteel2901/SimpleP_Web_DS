@@ -28,15 +28,15 @@ const env = () => ({
   onEvent: () => {},
 });
 
-function run(craft, { seconds = 20, throttle = 1, controls = {}, startY = null, startSpeed = 0, heading = 0, log = false, airborne = false, rotateAt = null, pitchInput = 0.75, targetPitch = 10 } = {}) {
-  const ac = new Aircraft(craft, { position: new THREE.Vector3(0, 500, 0), heading, isPlayer: true, assist: 0 });
+function run(craft, { seconds = 20, throttle = 1, controls = {}, startY = null, startSpeed = 0, heading = 0, log = false, airborne = false, rotateAt = null, pitchInput = 0.75, targetPitch = 10, assist = 0 } = {}) {
+  const ac = new Aircraft(craft, { position: new THREE.Vector3(0, 500, 0), heading, isPlayer: true, assist });
   if (startY == null) ac.placeOnGround(flatTerrain(0), 0, 0, heading);
   const y = startY != null ? startY : ac.body.position.y;
   if (airborne) {
     ac.body.velocity.set(0, 0, -startSpeed);
     ac.body.position.y = y;
   }
-  ac.controls.assist = 0;
+  ac.controls.assist = assist;
   ac.inputTarget.throttle = throttle;
   Object.assign(ac.inputTarget, controls);
   const e = env();
@@ -55,7 +55,7 @@ function run(craft, { seconds = 20, throttle = 1, controls = {}, startY = null, 
         ac.inputTarget.pitch = Math.max(-1, Math.min(1, err));
       }
     }
-    ac.controls.assist = 0;
+    ac.controls.assist = assist;
     ac.update(dt, e);
     if (i % Math.round(0.5 / dt) === 0 || i === steps - 1) {
       const s = ac.state;
@@ -98,11 +98,25 @@ if (craft.type === 'plane') {
   const last = r1.hist[r1.hist.length - 1];
   console.log((last.y > 30 ? '✅ 成功起飞并爬升' : (last.y > 3 ? '⚠️ 离地但爬升不足' : '❌ 未能起飞')) + `  (末速 ${last.spd} m/s, 高度 ${last.y} m, 油量 ${last.fuel})`);
 
-  console.log('\n--- 2) 空中配平（300m 高度 60m/s 平飞，无输入 20s）---');
-  const r2 = run(craft, { seconds: 20, throttle: 0.6, startY: 300, startSpeed: 60, airborne: true });
-  r2.hist.forEach((r) => console.log(line(r)));
-  const dy = r2.hist[r2.hist.length - 1].y - r2.hist[0].y;
-  console.log(`Δ高度=${dy.toFixed(1)}m  Δ滚转=${(r2.hist[r2.hist.length - 1].roll - r2.hist[0].roll).toFixed(1)}°`);
+  console.log('\n--- 2) 空中配平（设计巡航速度平飞，无输入 30s）---');
+  // 用机型自己的设计巡航速度起测，而不是硬编码 60m/s —— 后者对高速喷气机
+  // 是「离配平点很远」的状态，测出来的漂移反映不了配平质量。
+  const aero2 = new Aircraft(craft, { position: new THREE.Vector3(0, 1500, 0), isPlayer: true, assist: 0.5 })._analyzeAero();
+  const cruiseV = aero2.V > 30 ? aero2.V : 60;
+  const r2 = run(craft, { seconds: 30, throttle: 1, startY: 1500, startSpeed: cruiseV, airborne: true, assist: 0.5 });
+  const h2 = r2.hist[r2.hist.length - 1];
+  const dy = h2.y - r2.hist[0].y;
+  const droll = h2.roll - r2.hist[0].roll;
+  const dspd = h2.spd - r2.hist[0].spd;
+  console.log(`Δ高度=${dy.toFixed(1)}m  Δ速度=${dspd.toFixed(1)}m/s  Δ滚转=${droll.toFixed(1)}°`);
+  // 火箭机（Comet）靠燃料燃烧飞行，不存在气动巡航配平点，豁免
+  if (rocketish) {
+    console.log('⚠️ 火箭机：跳过配平稳态断言（设计为燃烧/滑翔）');
+  } else if (Math.abs(dy) < 150 && Math.abs(droll) < 15) {
+    console.log('✅ 松手后能自行收敛（高度/滚转稳定）');
+  } else {
+    console.log(`❌ 松手后失衡：高度漂 ${dy.toFixed(1)}m、滚转漂 ${droll.toFixed(1)}°（阈值 150m / 15°）`);
+  }
 
   // 操纵响应：直接检查 1 秒后角速度符号（机体轴）
   const rot = (controls, secs = 1.2) => {

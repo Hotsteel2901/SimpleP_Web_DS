@@ -171,6 +171,108 @@ export function makeSkyTexture(topColor, midColor, bottomColor, size = 512) {
   return t;
 }
 
+/**
+ * 航空蒙皮细节贴图：分块蒙皮线 + 铆钉 + 磨损噪声，同时产出法线图与粗糙度图。
+ * 灰度底（近白）供 material.color 染色，因此**所有涂装共用一套贴图**，零额外开销。
+ * 这是「模型材质清晰度」的关键：平面色块 + 光照再准也会显得像塑料，
+ * 有了蒙皮线与铆钉，机身才有尺度感与金属质感。
+ * @param {number} size 边长（默认 512）
+ * @returns {{map:THREE.Texture, normalMap:THREE.Texture, roughnessMap:THREE.Texture}}
+ */
+export function makePanelTextures(size = 512, seed = 20251) {
+  const c = canvas(size, size);
+  const cn = canvas(size, size);
+  const cr = canvas(size, size);
+  if (!c || !cn || !cr) return { map: null, normalMap: null, roughnessMap: null };
+  const g = ctx2d(c), gn = ctx2d(cn), gr = ctx2d(cr);
+  if (!g || !gn || !gr) return { map: null, normalMap: null, roughnessMap: null };
+  const rng = makeRng(seed);
+  // ---- 高度场：蒙皮拼缝（凹槽 = 负）+ 铆钉（小凸起）+ 轻微蒙皮起伏 ----
+  const H = new Float32Array(size * size);
+  for (let i = 0; i < H.length; i++) H[i] = (rng() - 0.5) * 0.06;      // 细噪声
+  const px = (x, y, v) => { if (x >= 0 && y >= 0 && x < size && y < size) H[y * size + x] += v; };
+  // 大块蒙皮起伏：必须「高频 + 低幅度」。
+  // 早期版本用了 ~300px 波长、幅度 0.10 的正弦，经 0.82+h*1.15 着色后
+  // 行均值波动高达 98/255（≈39% 亮度调制）—— 大面积机翼贴上去就像水波纹。
+  // 现在换成短波长（~40px）、极小幅度，只保留一点「蒙皮不是纯平面」的质感，
+  // 真正的尺度感交给拼缝与铆钉（那才是让人读出「金属蒙皮」的东西）。
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const big = Math.sin(x * 0.15 + Math.sin(y * 0.11) * 1.3) * Math.cos(y * 0.13 + Math.sin(x * 0.09) * 1.1);
+      H[y * size + x] += big * 0.018;
+    }
+  }
+  // 蒙皮拼缝：纵向 + 横向若干条（宽度 2px 的凹槽，两侧有轻微凸起）
+  const lines = [];
+  let y0 = 24 + rng() * 60;
+  while (y0 < size - 12) {
+    lines.push({ axis: 0, p: y0, s: (rng() - 0.5) * 0.9 });
+    y0 += size * (0.18 + rng() * 0.16);
+  }
+  let x0 = 30 + rng() * 80;
+  while (x0 < size - 12) {
+    lines.push({ axis: 1, p: x0, s: (rng() - 0.5) * 0.9 });
+    x0 += size * (0.22 + rng() * 0.2);
+  }
+  for (const L of lines) {
+    const wob = L.s * 6;
+    for (let t = 0; t < size; t++) {
+      const p = Math.round(L.p + Math.sin(t * 0.035 + L.p) * wob * 0.5);
+      for (let d = -2; d <= 2; d++) {
+        const w = d === 0 ? -1.0 : Math.abs(d) === 1 ? -0.45 : 0.18;   // 凹槽 + 两侧挤压凸起
+        if (L.axis === 0) px(t, p + d, w * 0.6); else px(p + d, t, w * 0.6);
+      }
+      // 铆钉：沿拼缝每 ~14px 一颗
+      if (L.axis === 0 && t % 14 === 0) for (const dx of [-6, 6]) for (let d = -1; d <= 1; d++) px(t + d, p + dx, 0.32);
+      if (L.axis === 1 && t % 14 === 0) for (const dy of [-6, 6]) for (let d = -1; d <= 1; d++) px(p + dy, t + d, 0.32);
+    }
+  }
+  // 检修口盖
+  for (let i = 0; i < 4; i++) {
+    const w = size * (0.08 + rng() * 0.1), h = size * (0.06 + rng() * 0.08);
+    const bx = Math.floor(rng() * (size - w - 20)) + 10, by = Math.floor(rng() * (size - h - 20)) + 10;
+    for (let x = 0; x < w; x++) { px(bx + x, by, -0.5); px(bx + x, by + h, -0.5); }
+    for (let y = 0; y < h; y++) { px(bx, by + y, -0.5); px(bx + w, by + y, -0.5); }
+  }
+  // ---- 由高度场生成 颜色 / 粗糙度 / 法线 ----
+  const img = g.createImageData(size, size);
+  const imn = gn.createImageData(size, size);
+  const imr = gr.createImageData(size, size);
+  const at = (x, y) => H[((y + size) % size) * size + ((x + size) % size)];
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const i = (y * size + x) * 4;
+      const h = H[y * size + x];
+      // 颜色：凹槽变暗，凸起微亮（其余保持近白，交给 material.color 染色）。
+      // 系数 1.15 会把拼缝拉成很深的黑线；降到 0.75 后拼缝仍清晰，但不再"沟壑感"。
+      const shade = clamp(0.90 + h * 0.75, 0.62, 1.06);
+      const v = shade * 255;
+      img.data[i] = img.data[i + 1] = img.data[i + 2] = v; img.data[i + 3] = 255;
+      // 粗糙度：拼缝/口盖更粗糙（积灰），大面稍光滑
+      const rough = clamp(0.62 - h * 0.35 + (rng() - 0.5) * 0.04, 0.32, 0.96);
+      const rv = rough * 255;
+      imr.data[i] = imr.data[i + 1] = imr.data[i + 2] = rv; imr.data[i + 3] = 255;
+      // 法线：中心差分
+      const dx = (at(x + 1, y) - at(x - 1, y)) * 2.2;
+      const dy = (at(x, y + 1) - at(x, y - 1)) * 2.2;
+      const len = Math.hypot(dx, dy, 1);
+      imn.data[i] = ((-dx / len) * 0.5 + 0.5) * 255;
+      imn.data[i + 1] = ((-dy / len) * 0.5 + 0.5) * 255;
+      imn.data[i + 2] = ((1 / len) * 0.5 + 0.5) * 255;
+      imn.data[i + 3] = 255;
+    }
+  }
+  g.putImageData(img, 0, 0); gn.putImageData(imn, 0, 0); gr.putImageData(imr, 0, 0);
+  const mk = (cv, srgb) => {
+    const t = new THREE.CanvasTexture(cv);
+    t.wrapS = t.wrapT = THREE.RepeatWrapping;
+    t.anisotropy = 8;
+    if (srgb) t.colorSpace = THREE.SRGBColorSpace;
+    return t;
+  };
+  return { map: mk(c, true), normalMap: mk(cn, false), roughnessMap: mk(cr, false) };
+}
+
 /** 生成简单材质噪声贴图（用于金属/机身） */
 export function makePaintTexture(color = '#c8d2dc', seed = 11, size = 128) {
   const c = canvas(size, size); if (!c) return null;

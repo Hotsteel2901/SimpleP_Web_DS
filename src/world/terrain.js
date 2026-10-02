@@ -332,7 +332,13 @@ export class Terrain {
     this._segments = seg;
 
     this._biome = Object.prototype.hasOwnProperty.call(BIOMES, o.biome) ? o.biome : DEFAULT_BIOME;
-    this._cfg = BIOMES[this._biome];
+    // biome 参数允许被单张地图覆盖。
+    // 起因：BIOMES 里的参数是按「典型」heightScale 调的，各 biome 的 ridgeAmp 隐含了
+    // 一个尺度假设。地图若声明了远超该假设的 heightScale（如 desert 的 ridgeAmp=0.30
+    // 配 heightScale=520），山脊项根本撑不起来 —— 实测最高峰只有 42m（声明值的 8%），
+    // 整张图塌成浅海，连机场都无处安放。有了这个覆盖口，地图可以自己校正形态参数，
+    // 而不必去动会波及其它地图的共享 biome 表。
+    this._cfg = o.biomeOverrides ? { ...BIOMES[this._biome], ...o.biomeOverrides } : BIOMES[this._biome];
 
     this._seaLevel = Number.isFinite(o.seaLevel) ? o.seaLevel : 0;
     this._heightScale = Number.isFinite(o.heightScale) && o.heightScale > 0 ? o.heightScale : 900;
@@ -370,6 +376,9 @@ export class Terrain {
     // ---- 平整区 ----
     this._regions = this._normalizeRegions(o.flatRegions);
     if (this._regions.length === 0) this._regions = this._makeDefaultRegions();
+    // 地图里手工填的平整区高度常常和噪声地形差出几百米：直接照搬会在山里挖出巨坑、
+    // 或在海里立一根柱子。这里用平整区范围内的自然地形中位数做基准高度（切填平衡）。
+    this._reconcileRegions();
 
     // ---- 缓存/状态 ----
     this._heights = null;        // Float32Array((segments+1)^2) 网格顶点高度（与渲染完全一致）
@@ -1276,9 +1285,67 @@ export class Terrain {
         height: height,
         blend: blend,
         heading: Number.isFinite(r.heading) ? r.heading : 0,
+        fixed: r.fixed === true,
       });
     }
     return out;
+  }
+
+  /**
+   * 依据自然地形修正平整区高度。
+   *
+   * 采样策略：以「面积加权平均」代替简单中位数 —— 用多层环状采样（中心 + 内环 + 外环）
+   * 近似该圆盘上的平均高程，使挖方≈填方，跑道整体贴在山坡上而不是局部削平。
+   * 陡坡地图（如群岛）单纯取中位数会被山顶或谷底拉偏几百米，故内环取较高权重：
+   * 机场需要的是「这一片地」的代表高度，而不是某个极值点。
+   *
+   * 结果：不再出现几百米深的坑（山中）或海中的孤柱。
+   * 若区域显式标记 `fixed: true` 则保留地图写死的高度（浮空岛等特殊设计）。
+   * @private
+   */
+  _reconcileRegions() {
+    const rs = this._regions;
+    if (!rs.length) return;
+    for (const r of rs) {
+      if (r.fixed) continue;
+      r.authored = r.height;
+
+      // 中心 + 内环(0.55r) + 外环(0.9r)，按面积权重累积
+      let sum = 0, wsum = 0;
+      const acc = (dist, weight, n, phase) => {
+        for (let i = 0; i < n; i++) {
+          const a = (i / n) * Math.PI * 2 + phase;
+          const h = this._heightRaw(r.x + Math.cos(a) * dist, r.z + Math.sin(a) * dist);
+          sum += h * weight; wsum += weight;
+        }
+      };
+      acc(0, 1, 1, 0);                          // 中心
+      acc(r.radius * 0.55, 1, 6, 0.4);          // 内环（权重高：跑道主要在这片）
+      acc(r.radius * 0.9, 0.6, 8, 0.13);        // 外环（过渡带，权重低）
+      const mean = wsum > 0 ? sum / wsum : this._heightRaw(r.x, r.z);
+
+      // 贴合自然地形，只在「明显不合理」时才夹紧：
+      //
+      // 旧实现用 lo = seaLevel + 8 硬抬，遇到自然地形本就位于水下的机场
+      // （实测：Maywar 圆盘内 97% 低于海平面，均值 -24m）会把整片地
+      // 抬成海面上一座规则的圆形孤岛，blend 只有 252m 而抬升 32m，接缝还成了一道墙。
+      //
+      // 现在的策略：优先跟随自然地形；仅当它低到「机场会被淹」时才抬到刚好出水面，
+      // 且抬升量由「水面 + 跑道最低干舷」决定，不额外加码。
+      // 同时，若需要的抬升量很大，就把过渡带按抬升量放大，避免形成陡壁。
+      const runwayFreeboard = 6;                       // 跑道面离水面的最小干舷
+      const lo = this._seaLevel + runwayFreeboard;     // 只有被淹才抬到这里
+      const hi = this._seaLevel + Math.max(80, this._heightScale * 1.05);
+      r.height = clamp(mean, lo, hi);
+
+      // 按实际抬升/下切量放宽过渡带：落差越大，过渡越长，接缝越自然。
+      // （原本 blend 固定 = radius*0.6，对 30m 量级的抬升太短。）
+      const drop = Math.abs(r.height - mean);
+      if (drop > 6) {
+        const extra = clamp(drop * 4, 0, r.radius * 1.6);
+        r.blend = Math.max(r.blend, extra);
+      }
+    }
   }
 
   /** 未提供 flatRegions 时自动生成 3 个机场平地（保证 spawnPoints 一定有 3 个平坦出生点）。 */

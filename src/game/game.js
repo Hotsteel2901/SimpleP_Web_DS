@@ -8,6 +8,7 @@ import * as THREE from 'three';
 import { Terrain } from '../world/terrain.js';
 import { Landmarks } from '../world/landmarks.js';
 import { SkyDome, Weather } from '../world/sky.js';
+import { WindField } from '../world/wind.js';
 import { terrainOptions } from '../world/maps.js';
 import { Aircraft } from '../flight/aircraft.js';
 import { ProjectileManager } from '../flight/projectiles.js';
@@ -170,6 +171,9 @@ export class Game extends Emitter {
     this.maxSubSteps = 5;
     this.clock = 0;
     this.wind = new THREE.Vector3();
+    this.windField = null;
+    /** 风场采样回调（供 Aircraft 逐机使用；无风场时退回常量风） */
+    this.windAt = (x, y, z, out) => (this.windField ? this.windField.sample(x, y, z, out) : out.copy(this.wind));
     this.gravity = 9.81;
     this.stats = { fps: 0, frameMs: 0 };
     this._fpsAccum = 0; this._fpsCount = 0;
@@ -194,6 +198,8 @@ export class Game extends Emitter {
     this.terrain = new Terrain(opts);
     this.terrain.build(this.scene);
     this.rig.terrainRef = this.terrain;
+    // 风场（基础风 + 高度梯度 + 地形爬坡气流 + 阵风湍流）
+    this.windField = WindField.fromMap(mapDef, this.terrain);
     onProgress(0.45, '搭建地标…');
     await frame();
 
@@ -209,6 +215,12 @@ export class Game extends Emitter {
       timeOfDay: mapDef.timeOfDay ?? 0.4, cloudiness: mapDef.cloudiness ?? 0.4,
       radius: Math.min(13000, Math.max(7000, mapDef.size * 0.8)), shadows: this.renderer.shadowMap.enabled,
       shadowDistance: 420,
+      // PMREMGenerator 必须拿到真实 WebGLRenderer 才能跑预处理着色器；
+      // 之前没传 → new PMREMGenerator(null) → fromEquirectangular() 静默失败，
+      // 于是 scene.environment 永远是 null，金属/玻璃完全没有环境反射。
+      // 无头模式用桩渲染器，传 false 直接跳过 IBL。
+      renderer: this.headless ? null : this.renderer,
+      pmrem: !this.headless,
     });
     this.weather = new Weather(this.scene, { type: mapDef.weather || 'none', count: quality >= 2 ? 3600 : 1800 });
     this.projectiles = new ProjectileManager(this.scene, {
@@ -224,6 +236,7 @@ export class Game extends Emitter {
   unloadWorld() {
     for (const ac of this.aircraft) ac.dispose?.();
     this.aircraft.length = 0;
+    this.windField = null;
     this.player = null;
     this.projectiles?.dispose(); this.projectiles = null;
     this.landmarks?.dispose(); this.landmarks = null;
@@ -435,6 +448,12 @@ export class Game extends Emitter {
       this.landmarks?.update(dt, this.clock, this.camera);
       this._updateTurrets(dt);
       this.terrain.update(dt);
+      // 风场推进（阵风包络/风向摆动），再取一次玩家所在位置的风供 HUD/音效用
+      if (this.windField) {
+        this.windField.update(dt);
+        const p = this.player?.body.position || this.camera.position;
+        this.windField.horizontal && this.wind.copy(this.windField.sample(p.x, p.y, p.z, this.wind));
+      }
     }
 
     // 相机
@@ -465,6 +484,8 @@ export class Game extends Emitter {
     env.projectiles = this.projectiles;
     env.gravity = this.gravity;
     env.wind = this.wind;
+    // 风场：随位置/高度/地形变化（高度梯度、迎风坡上升、阵风湍流）
+    env.windAt = this.windAt;
     env.targets = this.aircraft;
     env.onEvent = (type, data) => this._onAircraftEvent(type, data);
     env.onImpact = (ac, point, strength, col) => this._onImpact(ac, point, strength, col);

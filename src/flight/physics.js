@@ -145,6 +145,30 @@ export class RigidBody {
 
 /* ------------------------------------------------------------------ 气动 */
 /**
+ * 翼面气动中心（焦点）相对「零件原点」的 z 偏移，单位米。
+ * ------------------------------------------------------------------
+ * 零件原点在翼根弦的中点（见 build/parts.js 的 wingGeometry 约定），而真实升力作用在
+ * 平均气动弦（MAC）的 1/4 处 —— 对带收缩比 / 后掠的翼面，这两点差得很远：
+ *   · 矩形翼（λ=1, 无后掠）：Δz = -0.25c
+ *   · 三角翼（λ=0.12, 后掠 2.4m）：Δz ≈ -0.18c
+ * 用错位置会让整机中性点评估差出 0.5m 量级，配平舵量与静稳定性全跑偏
+ * （现象就是「机翼看着装错地方」「一松手就抬头/低头」）。
+ * @param {number} chord 翼根弦长
+ * @param {number} taper 收缩比（1 = 矩形）
+ * @param {number} sweep 翼尖后掠量（米）
+ */
+export function acOffset(chord, taper = 1, sweep = 0) {
+  const lam = clamp(taper, 0.05, 1);
+  const mac = (2 / 3) * chord * (1 + lam + lam * lam) / (1 + lam);
+  const zLE = sweep * (1 + 2 * lam) / (3 * (1 + lam));   // MAC 前缘相对翼根前缘的后移
+  const acNormal = zLE + 0.25 * mac;                     // 常规翼：1/4 MAC（相对翼根前缘）
+  // 三角翼/小展弦比：前缘涡提供额外升力，焦点明显后移到 0.4~0.5 根弦
+  const slender = clamp((0.45 - lam) / 0.4, 0, 1);
+  const ac = lerp(acNormal, 0.45 * chord, slender * 0.7);
+  return ac - 0.5 * chord;
+}
+
+/**
  * 翼面气动求解。
  * @param {object} s 翼面描述（机体坐标系）
  *   { area, span, chord, thick, cd0, control, controlSign, position(THREE.Vector3 机体),
@@ -154,11 +178,19 @@ export class RigidBody {
  * @param {object} ctl 控制输入 { pitch, roll, yaw, flap, airbrake, speed }
  * @param {object} out 复用的输出对象 { forceLocal:Vector3, alpha, cl, cd, stall, q }
  */
-export function solveWing(s, vLocal, density, ctl, out) {
+export function solveWing(s, vLocal, density, ctl, out, betaOverride) {
   const f = out.forceLocal.set(0, 0, 0);
   const u = vLocal.dot(s.chordDir);   // 弦向分量（前飞为负）
   const w = vLocal.dot(s.normal);     // 法向分量
-  const side = vLocal.dot(s.spanDir);
+  // 展向速度：只有「水平翼面」的展向流才等价于侧滑。
+  // 垂尾的展向是机体的 Y 轴，而机体 Y 方向的相对气流在正常抬头/低头时并不为零
+  // （那是迎角，已经计入 alpha）—— 若直接拿它当侧滑，垂尾会凭空产生巨大的
+  // 竖直力与低头力矩（实测 5.7° 迎角下凭空多出 2792N，把配平彻底带偏，
+  // 表现为「松手就爬升/掉高」）。因此侧滑统一由机体侧滑角 beta 给出。
+  const sideRaw = vLocal.dot(s.spanDir);
+  const side = Number.isFinite(betaOverride)
+    ? Math.sin(clamp(betaOverride, -1.2, 1.2)) * Math.abs(u || w || 1)
+    : sideRaw;
   const V2 = u * u + w * w + side * side * 0.35;
   const V = Math.sqrt(V2);
   out.q = 0.5 * density * V2;
@@ -176,12 +208,13 @@ export function solveWing(s, vLocal, density, ctl, out) {
   let dCL = 0;
   let flapDrag = 0;
   if (s.control) {
-    const eff = 0.55 + 0.45 * clamp01(s.area / Math.max(0.2, s.area * 0 + 1.5));
-    if (s.control === 'elevator') dCL += -ctl.pitch * 0.92 * (s.pitchDir ?? s.controlDir ?? 1);
-    else if (s.control === 'aileron') dCL += ctl.roll * 0.62 * (s.rollDir ?? s.controlDir ?? 1);
-    else if (s.control === 'rudder') dCL += ctl.yaw * 0.75 * (s.rudderDir ?? s.controlDir ?? 1);
+    // 舵面效率：面积越大越接近 1（真实舵面占翼面 20~30% 时效率很高）
+    const eff = 0.7 + 0.3 * clamp01(s.area / 1.5);
+    if (s.control === 'elevator') dCL += -ctl.pitch * 1.15 * (s.pitchDir ?? s.controlDir ?? 1);
+    else if (s.control === 'aileron') dCL += ctl.roll * 0.75 * (s.rollDir ?? s.controlDir ?? 1);
+    else if (s.control === 'rudder') dCL += ctl.yaw * 0.85 * (s.rudderDir ?? s.controlDir ?? 1);
     else if (s.control === 'flap') { dCL += (ctl.flap ?? 0) * 1.05; flapDrag = (ctl.flap ?? 0) * 0.09; }
-    else if (s.control === 'elevon') dCL += (-ctl.pitch * 0.75 * (s.pitchDir ?? 1) + ctl.roll * 0.45 * (s.rollDir ?? 1));
+    else if (s.control === 'elevon') dCL += (-ctl.pitch * 0.85 * (s.pitchDir ?? 1) + ctl.roll * 0.5 * (s.rollDir ?? 1));
     else if (s.control === 'airbrake') { dCL *= 0; flapDrag = (ctl.airbrake ?? 0) * 1.4; }
     dCL *= eff;
   }
@@ -215,8 +248,11 @@ export function solveWing(s, vLocal, density, ctl, out) {
   const qS = out.q * s.area;
   f.addScaledVector(_v2, qS * CL);
   f.addScaledVector(_v1, -qS * CD);
-  // 侧滑侧力（机身/垂尾的展向阻力）
-  const beta = Math.atan2(side, Math.max(1e-4, -u));
+  // 侧滑侧力：垂直翼面（垂尾/腹鳍）由真实侧滑角产生侧向力，水平翼面由展向流产生。
+  // 两者都归一到「该翼面的有效展向流」再算 beta，避免迎角分量被重复计入。
+  const beta = (s.washable === false)
+    ? clamp(betaOverride ?? 0, -0.6, 0.6)                      // 垂直翼面：直接用机体侧滑角
+    : Math.atan2(side, Math.max(1e-4, -u));                    // 水平翼面：展向流/弦向流
   f.addScaledVector(s.spanDir, -qS * clamp(beta, -0.6, 0.6) * (s.sideForce ?? 1.1));
   return out;
 }
