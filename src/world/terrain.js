@@ -332,7 +332,13 @@ export class Terrain {
     this._segments = seg;
 
     this._biome = Object.prototype.hasOwnProperty.call(BIOMES, o.biome) ? o.biome : DEFAULT_BIOME;
-    this._cfg = BIOMES[this._biome];
+    // biome 参数允许被单张地图覆盖。
+    // 起因：BIOMES 里的参数是按「典型」heightScale 调的，各 biome 的 ridgeAmp 隐含了
+    // 一个尺度假设。地图若声明了远超该假设的 heightScale（如 desert 的 ridgeAmp=0.30
+    // 配 heightScale=520），山脊项根本撑不起来 —— 实测最高峰只有 42m（声明值的 8%），
+    // 整张图塌成浅海，连机场都无处安放。有了这个覆盖口，地图可以自己校正形态参数，
+    // 而不必去动会波及其它地图的共享 biome 表。
+    this._cfg = o.biomeOverrides ? { ...BIOMES[this._biome], ...o.biomeOverrides } : BIOMES[this._biome];
 
     this._seaLevel = Number.isFinite(o.seaLevel) ? o.seaLevel : 0;
     this._heightScale = Number.isFinite(o.heightScale) && o.heightScale > 0 ? o.heightScale : 900;
@@ -1318,9 +1324,27 @@ export class Terrain {
       acc(r.radius * 0.9, 0.6, 8, 0.13);        // 外环（过渡带，权重低）
       const mean = wsum > 0 ? sum / wsum : this._heightRaw(r.x, r.z);
 
-      const lo = this._seaLevel + 8;
+      // 贴合自然地形，只在「明显不合理」时才夹紧：
+      //
+      // 旧实现用 lo = seaLevel + 8 硬抬，遇到自然地形本就位于水下的机场
+      // （实测：Maywar 圆盘内 97% 低于海平面，均值 -24m）会把整片地
+      // 抬成海面上一座规则的圆形孤岛，blend 只有 252m 而抬升 32m，接缝还成了一道墙。
+      //
+      // 现在的策略：优先跟随自然地形；仅当它低到「机场会被淹」时才抬到刚好出水面，
+      // 且抬升量由「水面 + 跑道最低干舷」决定，不额外加码。
+      // 同时，若需要的抬升量很大，就把过渡带按抬升量放大，避免形成陡壁。
+      const runwayFreeboard = 6;                       // 跑道面离水面的最小干舷
+      const lo = this._seaLevel + runwayFreeboard;     // 只有被淹才抬到这里
       const hi = this._seaLevel + Math.max(80, this._heightScale * 1.05);
       r.height = clamp(mean, lo, hi);
+
+      // 按实际抬升/下切量放宽过渡带：落差越大，过渡越长，接缝越自然。
+      // （原本 blend 固定 = radius*0.6，对 30m 量级的抬升太短。）
+      const drop = Math.abs(r.height - mean);
+      if (drop > 6) {
+        const extra = clamp(drop * 4, 0, r.radius * 1.6);
+        r.blend = Math.max(r.blend, extra);
+      }
     }
   }
 
