@@ -101,8 +101,13 @@ class App {
     await this.initVibeHub();
     await this.loadStockCrafts();
     this.ui.loadingDone();
-    this.setState('menu');
-    this.ui.mainMenu();
+    // 竞态防护：initVibeHub() 要访问网络，可能耗时数秒。若用户在这期间已经
+    // 点进飞行/建造器，boot 尾部的 setState('menu') 会把刚设好的 'loading'/'flight'
+    // 覆盖回菜单，导致「点了开始飞行却弹回主菜单」。只有仍停留在 boot 阶段才进菜单。
+    if (this.state === 'boot') {
+      this.setState('menu');
+      this.ui.mainMenu();
+    }
     this.loop();
   }
 
