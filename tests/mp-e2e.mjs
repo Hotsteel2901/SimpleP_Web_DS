@@ -7,6 +7,7 @@
  */
 import { spawn } from 'node:child_process';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { fileURLToPath } from 'node:url';
 import * as THREE from 'three';
 import { Game } from '../src/game/game.js';
 import { stockCrafts } from '../src/build/crafts.js';
@@ -26,7 +27,7 @@ const waitFor = async (fn, timeout = 8000, step = 60) => {
 };
 
 /* ---------------------------------------------------------------- 启动服务器 */
-const server = spawn(process.execPath, ['server.js', String(PORT)], { cwd: new URL('..', import.meta.url).pathname, stdio: ['ignore', 'pipe', 'pipe'] });
+const server = spawn(process.execPath, ['server.js', String(PORT)], { cwd: fileURLToPath(new URL('..', import.meta.url)), stdio: ['ignore', 'pipe', 'pipe'] });
 let serverOut = '';
 server.stdout.on('data', (d) => { serverOut += d.toString(); });
 server.stderr.on('data', (d) => { serverOut += d.toString(); });

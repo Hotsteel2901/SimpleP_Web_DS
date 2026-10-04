@@ -6,8 +6,9 @@ import { readdir, readFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { fileURLToPath } from 'node:url';
 const exec = promisify(execFile);
-const ROOT = resolve(new URL('..', import.meta.url).pathname);
+const ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
 
 async function walk(dir, out = []) {
   for (const e of await readdir(dir, { withFileTypes: true })) {
@@ -27,7 +28,7 @@ for (const f of files) {
 console.log(`语法检查：${files.length} 个文件，${bad} 个失败`);
 
 // 导入检查（无 DOM 的模块）
-const domFree = files.filter((f) => !/src\/(ui|main)/.test(f));
+const domFree = files.filter((f) => !/(^|[\\/])src[\\/](?:ui([\\/]|$)|main([.]|$))/.test(f));
 for (const f of domFree) {
   try {
     await import('file://' + f);

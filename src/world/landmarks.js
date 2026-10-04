@@ -1370,15 +1370,29 @@ export class Landmarks {
   // 碰撞体
   // ===========================================================================
 
-  /** 世界坐标 AABB 碰撞体。 */
+  /** 世界坐标盒碰撞体；oriented=true 时 halfExtents 保存旋转后的世界 AABB。 */
   addBoxCollider(kind, cx, cy, cz, hx, hy, hz, o = {}) {
     if (this._colliders.length >= this.maxColliders) { this._skippedColliders++; return null; }
+    const heading = typeof o.heading === 'number' && Number.isFinite(o.heading) ? o.heading : 0;
+    const localHalfExtents = o.oriented ? new THREE.Vector3(hx, hy, hz) : null;
+    const halfExtents = localHalfExtents
+      ? new THREE.Vector3(
+        Math.abs(Math.cos(heading)) * hx + Math.abs(Math.sin(heading)) * hz,
+        hy,
+        Math.abs(Math.sin(heading)) * hx + Math.abs(Math.cos(heading)) * hz,
+      )
+      : new THREE.Vector3(hx, hy, hz);
     const c = {
       id: o.id || `${this.kit}_${kind}_${this._colliderSeq++}`,
       kind,
       shape: 'box',
       center: new THREE.Vector3(cx, cy, cz),
-      halfExtents: new THREE.Vector3(hx, hy, hz),
+      // 通用碰撞/空间哈希使用保守世界 AABB；落地查询另用局部尺寸与朝向。
+      halfExtents,
+      localHalfExtents,
+      quaternion: localHalfExtents
+        ? new THREE.Quaternion(0, Math.sin(heading * 0.5), 0, Math.cos(heading * 0.5))
+        : null,
       destructible: !!o.destructible,
       health: typeof o.health === 'number' ? o.health : 0,
       maxHealth: typeof o.health === 'number' ? o.health : 0,
@@ -1388,7 +1402,11 @@ export class Landmarks {
       sensor: !!o.sensor,
       floating: !!o.floating,
       name: o.name || kind,
-      heading: typeof o.heading === 'number' ? o.heading : 0,
+      heading,
+      platformCos: localHalfExtents ? Math.cos(heading) : 1,
+      platformSin: localHalfExtents ? Math.sin(heading) : 0,
+      surfaceY: Number.isFinite(o.surfaceY) ? o.surfaceY : null,
+      surfaceSlope: Number.isFinite(o.surfaceSlope) ? o.surfaceSlope : 0,
       destroyed: false,
     };
     this._colliders.push(c);
@@ -2008,13 +2026,15 @@ export class Landmarks {
       const v = run / uvScale;
       uv.push(0, v, 1, v);
     }
+    // 顶面法线必须朝上：right -> next-left 的原始绕序是顺时针（-Y）。
+    // 反转绕序，否则 MeshStandardMaterial 的 FrontSide 会从上方把道路整片剔除。
     for (let i = 0; i < n - 1; i++) {
       const a = i * 2;
-      idx.push(a, a + 1, a + 2, a + 1, a + 3, a + 2);
+      idx.push(a, a + 2, a + 1, a + 1, a + 2, a + 3);
     }
     if (closed) {
       const a = (n - 1) * 2;
-      idx.push(a, a + 1, 0, a + 1, 1, 0);
+      idx.push(a, 0, a + 1, a + 1, 0, 1);
     }
     const g = new THREE.BufferGeometry();
     g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
@@ -2272,11 +2292,9 @@ export class Landmarks {
     // 跑道底座（把地形垫平）+ 停机坪底板
     const slab = this.box(wid + 46, slabH, len + 60, this._mats.concrete, x, slabTop - slabH / 2, z, { ry });
     slab.name = 'runway_slab';
-    // autoLevel 关闭时保持与旧版完全一致的碰撞数值
-    const colHalfY = opts.autoLevel ? slabH * 0.5 : 2.4;
-    const colCenterY = opts.autoLevel ? slabTop - slabH * 0.5 : slabTop - 1.0;
-    this.addBoxCollider('runway', x, colCenterY, z, (wid + 46) / 2, colHalfY, (len + 60) / 2, {
-      object: slab, static: true, name: name + ' runway', heading: ry,
+    this.addBoxCollider('runway', x, slab.position.y, z, (wid + 46) / 2, slabH / 2, (len + 60) / 2, {
+      object: slab, static: true, name: name + ' runway', heading: ry, oriented: true,
+      surfaceY: slabTop + 0.04,
     });
 
     // 沥青跑道面
@@ -2298,8 +2316,9 @@ export class Landmarks {
     const apronC = W(0, wid / 2 + apronW / 2);
     const apron = this.box(apronW, slabH, len * 0.62, this._mats.asphalt, apronC.x, slabTop - slabH / 2, apronC.z, { ry });
     apron.name = 'apron';
-    this.addBoxCollider('runway', apronC.x, colCenterY, apronC.z, apronW / 2, colHalfY, len * 0.31, {
-      object: apron, static: true, name: name + ' apron', heading: ry,
+    this.addBoxCollider('runway', apronC.x, apron.position.y, apronC.z, apronW / 2, slabH / 2, len * 0.31, {
+      object: apron, static: true, name: name + ' apron', heading: ry, oriented: true,
+      surfaceY: slabTop,
     });
     // 停机位黄线（先按 heading 旋转再平移到世界坐标，避免整体旋转导致漂移）
     const gateGeos = [];
@@ -2434,7 +2453,7 @@ export class Landmarks {
     door.name = 'hangar_door';
     this._stats.buildings++;
     this.addBoxCollider('hangar', x, y + h * 0.62, z, w / 2, h * 0.62 + w * 0.2, len / 2, {
-      destructible: true, health: 900, mass: 9000, name: 'Hangar', object: wall, ry,
+      destructible: true, health: 900, mass: 9000, name: 'Hangar', object: wall, heading: ry, oriented: true,
     });
     return g;
   }
@@ -2895,8 +2914,9 @@ export class Landmarks {
     const c = W(len * 0.5, 0);
     const deck = this.box(wid, 1.2, len, this._mats.wood, c.x, deckY, c.z, { ry: heading });
     deck.name = 'dock';
-    this.addBoxCollider('prop', c.x, deckY, c.z, wid / 2, 0.9, len / 2, {
-      destructible: false, name: 'Dock', object: deck,
+    this.addBoxCollider('prop', c.x, deckY, c.z, wid / 2, 0.6, len / 2, {
+      destructible: false, name: 'Dock', object: deck, heading, oriented: true,
+      surfaceY: deckY + 0.6,
     });
     // 桩
     const pileGeos = [];
@@ -2975,7 +2995,8 @@ export class Landmarks {
     const deck = this.box(wid, 3, len, this._mats.concrete, c.x, deckY, c.z, { ry: heading });
     deck.name = 'bridge_deck';
     this.addBoxCollider('prop', c.x, deckY, c.z, wid / 2, 1.5, len / 2, {
-      destructible: false, name: 'Cable bridge deck', object: deck, heading,
+      destructible: false, name: 'Cable bridge deck', object: deck, heading, oriented: true,
+      surfaceY: deckY + 1.5,
     });
     // 桥墩
     for (const f of [-len * 0.32, 0, len * 0.32]) {
@@ -2984,7 +3005,7 @@ export class Landmarks {
       const pier = this.box(9, gh, 16, this._mats.concrete, p.x, deckY - 1.5 - gh / 2, p.z, { ry: heading });
       pier.name = 'bridge_pier';
       this.addBoxCollider('prop', p.x, deckY - 1.5 - gh / 2, p.z, 4.5, gh / 2, 8, {
-        destructible: true, health: 1200, mass: 20000, name: 'Bridge pier', object: pier,
+        destructible: true, health: 1200, mass: 20000, name: 'Bridge pier', object: pier, heading, oriented: true,
       });
     }
     // 桥塔 + 拉索（用细柱近似）
@@ -4081,12 +4102,14 @@ export class Landmarks {
     const pillars = [];
     const rails = [];
     const P = pts.map((p) => (Array.isArray(p) ? { x: p[0], z: p[1] } : p));
-    for (let i = 0; i < P.length - 1; i++) {
-      const a = P[i], b = P[i + 1];
-      const dx = b.x - a.x, dz = b.z - a.z;
+    const segmentCount = opts.closed ? P.length : P.length - 1;
+    for (let i = 0; i < segmentCount; i++) {
+      const a = P[i];
+      const next = P[(i + 1) % P.length];
+      const dx = next.x - a.x, dz = next.z - a.z;
       const dl = Math.hypot(dx, dz) || 1;
       const nx = -dz / dl, nz = dx / dl;
-      const mx = (a.x + b.x) / 2, mz = (a.z + b.z) / 2;
+      const mx = (a.x + next.x) / 2, mz = (a.z + next.z) / 2;
       const ground = this._heightAt(mx, mz);
       const ph = Math.max(2, alt - ground);
       pillars.push(new THREE.CylinderGeometry(2.6, 3.4, ph, 8).translate(mx, ground + ph / 2, mz));
@@ -4101,12 +4124,16 @@ export class Landmarks {
     }
     this.mergedMesh(pillars, this._mats.concreteDark, 'viaduct_pillars');
     this.mergedMesh(rails, this._mats.paintWhite, 'viaduct_rails');
-    // 高架路碰撞：沿路每隔一段一个盒子
-    const step = Math.max(1, Math.floor(P.length / 8));
-    for (let i = 0; i < P.length; i += step) {
-      this.addBoxCollider('prop', P[i].x, alt, P[i].z, width / 2, 1.6, step * 60, {
-        destructible: false, name: 'Viaduct',
-      });
+    // 每个路段一个朝向正确的薄盒；旧版沿世界 Z 放置长 AABB，弯道处会漏碰撞。
+    for (let i = 0; i < segmentCount; i++) {
+      const a = P[i], b = P[(i + 1) % P.length];
+      const dx = b.x - a.x, dz = b.z - a.z;
+      const length = Math.hypot(dx, dz);
+      if (length < 1e-3) continue;
+      this.addBoxCollider('prop', (a.x + b.x) * 0.5, alt - 0.8, (a.z + b.z) * 0.5,
+        width / 2, 0.8, length / 2 + 0.75, {
+          destructible: false, name: 'Viaduct', heading: Math.atan2(dx, dz), oriented: true, surfaceY: alt,
+        });
     }
     return deck;
   }
@@ -5084,10 +5111,11 @@ export class Landmarks {
       const bh = Math.max(6, top - (gy - 12));
       this.box(30, bh, 34, this._mats.concrete, 0, top - bh / 2, lz, { parent: g });
       this.addBoxCollider('prop', w.x, top - bh / 2, w.z, 15, bh / 2, 17, {
-        destructible: false, name: 'Bridge anchorage',
+        destructible: false, name: 'Bridge anchorage', heading, oriented: true,
       });
       // 引道：从桥面高度降到地面
       const ramp = [];
+      const rampSamples = [];
       const rampLen = 620;
       let foot = null;
       for (let i = 0; i <= 10; i++) {
@@ -5097,10 +5125,26 @@ export class Landmarks {
         const gy2 = Math.max(this._heightAt(p.x, p.z), this.seaLevel);
         const y = lerp(deckY - 2, gy2, Math.pow(t, 0.7));
         ramp.push([p.x, y, p.z]);
+        rampSamples.push({ f, y });
         if (i === 10) foot = { x: p.x, z: p.z };
       }
       if (end < 0) rampFootA = foot; else rampFootB = foot;
       this.ribbon(ramp, width - 6, this._mats.asphalt, { lift: 0.2, uvScale: 9, name: 'bridge_ramp', centerLine: true, dashScale: 5 });
+      // 逐段登记斜坡面；按局部 Z 方向插值高度，飞机不会在水面上穿过引桥。
+      for (let i = 0; i < rampSamples.length - 1; i++) {
+        const a = rampSamples[i], b = rampSamples[i + 1];
+        const df = b.f - a.f;
+        const segLen = Math.abs(df);
+        const fm = (a.f + b.f) * 0.5;
+        const center = L2W(0, fm);
+        const midY = (a.y + b.y) * 0.5;
+        const halfY = Math.max(0.6, Math.abs(b.y - a.y) * 0.5 + 0.25);
+        this.addBoxCollider('runway', center.x, midY, center.z,
+          (width - 6) / 2, halfY, segLen / 2 + 0.75, {
+            destructible: false, name: 'Bridge ramp', heading, oriented: true,
+            surfaceY: midY + 0.2, surfaceSlope: df ? (b.y - a.y) / df : 0,
+          });
+      }
       // 引桥桥墩
       const piers = [];
       for (let i = 2; i <= 8; i++) {
@@ -5115,25 +5159,27 @@ export class Landmarks {
       this.mergedMesh(piers, this._mats.concreteDark, 'bridge_ramp_piers');
     }
 
-    // ---- 碰撞：桥面平台（轴对齐时 1 个 box 即可精确匹配） ----
+    // ---- 碰撞：桥面平台（局部尺寸 + heading；runway 类型仅跳过机身障碍碰撞） ----
     const axisAligned = Math.abs(sin) < 0.02 || Math.abs(cos) < 0.02;
     const deckHalfY = 1.6;
+    const deckCenterY = deckY - deckHalfY;
     if (axisAligned) {
-      this.addBoxCollider('runway', x, deckY, z, width / 2, deckHalfY, halfDeck, {
-        destructible: false, name: 'Bridge deck', heading,
+      this.addBoxCollider('runway', x, deckCenterY, z, width / 2, deckHalfY, halfDeck, {
+        destructible: false, name: 'Bridge deck', heading, oriented: true,
+        surfaceY: deckY + 0.05,
       });
     } else {
-      // 非轴对齐（罕见）：拆成若干段保守 AABB，保证平台顶面仍然可用
+      // 斜向桥拆成重叠的窄段，既缩小子弹粗筛范围，也保留精确的平台占地。
       const seg = 18;
       const segHalf = halfDeck / seg;
       for (let i = 0; i < seg; i++) {
         const lz = -halfDeck + segHalf * (2 * i + 1);
         const p = L2W(0, lz);
-        this.addBoxCollider('runway', p.x, deckY, p.z,
-          Math.abs(cos) * segHalf + Math.abs(sin) * (width / 2),
+        this.addBoxCollider('runway', p.x, deckCenterY, p.z,
+          width / 2,
           deckHalfY,
-          Math.abs(sin) * segHalf + Math.abs(cos) * (width / 2),
-          { destructible: false, name: 'Bridge deck segment', heading });
+          segHalf + 0.75,
+          { destructible: false, name: 'Bridge deck segment', heading, oriented: true, surfaceY: deckY + 0.05 });
       }
     }
     const towerW = width / 2 + 3.5;
@@ -5273,8 +5319,9 @@ export class Landmarks {
       }
     }
     this.mergedMesh(lines, this._mats.paintWhite, 'parking_lines', g);
-    this.addBoxCollider('runway', x, y + 0.25, z, w / 2, 0.3, d / 2, {
-      destructible: false, name: 'Parking apron', heading: ry,
+    this.addBoxCollider('runway', x, y + 0.25, z, w / 2, 0.25, d / 2, {
+      destructible: false, name: 'Parking apron', heading: ry, oriented: true,
+      surfaceY: y + 0.5,
     });
     // 小汽车（世界坐标实例化）
     const pts = [];
@@ -5307,7 +5354,12 @@ export class Landmarks {
     const W = (f, r) => ({ x: x - f * sin + r * cos, z: z - f * cos - r * sin });
     const c = W(0, off);
     // 滑行道
-    this.box(wid + 6, 0.5, len, this._mats.asphalt, c.x, slabTop + 0.05, c.z, { ry: heading });
+    const taxiway = this.box(wid + 6, 0.5, len, this._mats.asphalt, c.x, slabTop + 0.05, c.z, { ry: heading });
+    taxiway.name = 'taxiway';
+    this.addBoxCollider('runway', c.x, taxiway.position.y, c.z, (wid + 6) / 2, 0.25, len / 2, {
+      destructible: false, name: 'Taxiway', heading, oriented: true,
+      surfaceY: taxiway.position.y + 0.25,
+    });
     // 黄中线（合并）
     const lines = [];
     for (let i = 0; i < 6; i++) {
@@ -5325,6 +5377,10 @@ export class Landmarks {
       g2.applyMatrix4(mat4(0, 0, 0, 0, heading, 0));
       g2.translate(p.x, slabTop + 0.05, p.z);
       connectors.push(g2);
+      this.addBoxCollider('runway', p.x, slabTop + 0.05, p.z, off * 0.45, 0.25, 8, {
+        destructible: false, name: 'Taxiway connector', heading, oriented: true,
+        surfaceY: slabTop + 0.3,
+      });
     }
     this.mergedMesh(connectors, this._mats.asphalt, 'taxiway_connectors');
     this.mergedMesh(lines, this._mats.paintYellow, 'taxiway_lines');
@@ -5398,8 +5454,9 @@ export class Landmarks {
     const D = opts.depth || 120;
     const wallH = opts.wallHeight || 15;
     const wallT = 5.5;
+    const ry = opts.ry || 0;
     const g = this.group(x, topY, z);
-    g.rotation.y = opts.ry || 0;
+    g.rotation.y = ry;
     g.name = 'castle';
     const stone = this._mat('castleStone', () => new THREE.MeshStandardMaterial({
       map: this._tex.stoneWall('#8b8375'), color: 0xffffff, roughness: 0.95, metalness: 0.03,
@@ -5507,7 +5564,7 @@ export class Landmarks {
     flag.name = 'castle_flag';
     this._swayers.push({ obj: flag, axis: 'y', base: 0, amp: 0.16, speed: 1.3, phase: this._rng() * 6.28 });
     // 碰撞：4 段城墙 + 4 角楼 + 主楼
-    const c = Math.cos(opts.ry || 0), sn = Math.sin(opts.ry || 0);
+    const c = Math.cos(ry), sn = Math.sin(ry);
     const L2W = (lx, lz) => ({ x: x + lx * c + lz * sn, z: z - lx * sn + lz * c });
     const segs = [
       [0, -D / 2, W / 2, wallT / 2], [0, D / 2, W / 2, wallT / 2],
@@ -5516,9 +5573,8 @@ export class Landmarks {
     for (const [lx, lz, hx2, hz2] of segs) {
       const p = L2W(lx, lz);
       this.addBoxCollider('building', p.x, topY + wallH / 2, p.z,
-        Math.abs(c) * hx2 + Math.abs(sn) * hz2, wallH / 2,
-        Math.abs(sn) * hx2 + Math.abs(c) * hz2,
-        { destructible: true, health: 1200, mass: 40000, name: 'Castle wall' });
+        hx2, wallH / 2, hz2,
+        { destructible: true, health: 1200, mass: 40000, name: 'Castle wall', heading: ry, oriented: true });
     }
     for (const sx of [-1, 1]) {
       for (const sz of [-1, 1]) {
@@ -5530,7 +5586,7 @@ export class Landmarks {
     }
     const kc2 = L2W(0, 0);
     this.addBoxCollider('building', kc2.x, topY + kh / 2, kc2.z, kw * 0.78, kh / 2, kd * 0.78, {
-      destructible: true, health: 4200, mass: 260000, name: 'Castle keep', object: keep,
+      destructible: true, health: 4200, mass: 260000, name: 'Castle keep', object: keep, heading: ry, oriented: true,
     });
     this._stats.buildings += 5;
     this._poi(opts.name || 'Vetusta Castle', x, topY + 58, z, 'castle', Math.max(W, D) * 0.9);
@@ -6286,4 +6342,3 @@ export class Landmarks {
     this._scatterCollectibles(10);
   }
 }
-

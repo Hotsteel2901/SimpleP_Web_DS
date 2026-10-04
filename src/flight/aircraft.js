@@ -900,17 +900,20 @@ export class Aircraft {
     this.groundContact = false;
     let onWater = false;
     let maxPen = 0;
+    this._onPlatform = false;
     for (const g of this.gears) {
       if (g.retractable && c.gearT < 0.85) { g.contact = false; g.grounded = 0; continue; }
       const wp = _v3.copy(g.position).applyQuaternion(body.quaternion).add(body.position);
       let gh = terrain ? terrain.heightAt(wp.x, wp.z) : 0;
       // 平台支撑：屋顶停机坪 / 航母甲板 / 桥梁等
       const plat = this._platformAt(wp.x, wp.z, wp.y, env);
-      if (plat != null && plat > gh) { gh = plat; this._onPlatform = true; }
-      const isWater = terrain ? terrain.isWater(wp.x, wp.z) : false;
+      const onPlatform = plat != null && plat > gh;
+      if (onPlatform) { gh = plat; this._onPlatform = true; }
+      // 桥/甲板位于水面上方时，按干燥平台处理，不套用水面浮力与低摩擦。
+      const isWater = !onPlatform && terrain ? terrain.isWater(wp.x, wp.z) : false;
       const targetY = gh + g.radius;
       if (wp.y <= targetY) {
-        const n = (terrain && !isWater) ? terrain.normalAt(wp.x, wp.z, _g1) : _g1.set(0, 1, 0);
+        const n = (terrain && !isWater && !onPlatform) ? terrain.normalAt(wp.x, wp.z, _g1) : _g1.set(0, 1, 0);
         // 限制最大穿透，防止初速穿透造成爆炸性弹力
         const pen = Math.min(targetY - wp.y, Math.max(g.travel * 2.2, 0.5));
         maxPen = Math.max(maxPen, pen);
@@ -968,11 +971,14 @@ export class Aircraft {
       const gearDown = this.gears.length && c.gearT > 0.85;
       for (const bp of this.bellyPoints) {
         const wp = _v3.copy(bp.pos).applyQuaternion(body.quaternion).add(body.position);
-        const isWater = terrain.isWater ? terrain.isWater(wp.x, wp.z) : false;
-        const gh = terrain.heightAt(wp.x, wp.z);
+        let gh = terrain.heightAt(wp.x, wp.z);
+        const plat = this._platformAt(wp.x, wp.z, wp.y, env);
+        const onPlatform = plat != null && plat > gh;
+        if (onPlatform) gh = plat;
+        const isWater = !onPlatform && terrain.isWater ? terrain.isWater(wp.x, wp.z) : false;
         const pen = gh + bp.r - wp.y;
         if (pen <= 0) continue;
-        const n = (!isWater && terrain.normalAt) ? terrain.normalAt(wp.x, wp.z, _g1) : _g1.set(0, 1, 0);
+        const n = (!isWater && !onPlatform && terrain.normalAt) ? terrain.normalAt(wp.x, wp.z, _g1) : _g1.set(0, 1, 0);
         const vAt = _v5.copy(body.velocity).add(_v6.crossVectors(body.angularVelocity, _v2.copy(wp).sub(body.position)));
         const vn = vAt.dot(n);
         let Fn = clamp(52000 * pen - 4200 * Math.min(0, vn), 0, (gearDown ? 22 : 30) * body.mass);
@@ -1030,11 +1036,19 @@ export class Aircraft {
     let best = null;
     for (let i = 0; i < cols.length; i++) {
       const c = cols[i];
-      if (c.shape !== 'box' || c.sensor || c.destroyed || c.kind === 'runway') continue;
-      const he = c.halfExtents; if (!he) continue;
-      if (x < c.center.x - he.x - 1 || x > c.center.x + he.x + 1) continue;
-      if (z < c.center.z - he.z - 1 || z > c.center.z + he.z + 1) continue;
-      const top = c.center.y + he.y;
+      if (c.shape !== 'box' || c.sensor || c.destroyed) continue;
+      const he = c.localHalfExtents || c.halfExtents; if (!he) continue;
+      let localX = x - c.center.x, localZ = z - c.center.z;
+      if (c.localHalfExtents) {
+        // 反旋转到平台局部坐标，避免斜向跑道/桥面只按世界 AABB 判定。
+        const dx = localX, dz = localZ;
+        localX = c.platformCos * dx - c.platformSin * dz;
+        localZ = c.platformSin * dx + c.platformCos * dz;
+      }
+      if (Math.abs(localX) > he.x + 1 || Math.abs(localZ) > he.z + 1) continue;
+      const top = Number.isFinite(c.surfaceY)
+        ? c.surfaceY + c.surfaceSlope * localZ
+        : c.center.y + he.y;
       if (top > wheelY + 1.2) continue;          // 高于机轮 -> 是墙不是地板
       if (top < wheelY - 30) continue;           // 太远的下方
       if (best == null || top > best) best = top;
@@ -1147,7 +1161,7 @@ export class Aircraft {
       for (let i = 0; i < cols.length; i++) {
         const col = cols[i];
         if (col.destroyed || col.sensor) continue;   // 传感器（光环/触发器）不参与碰撞
-        if (col.kind === 'runway') continue;         // 跑道由地形支撑，不做实体碰撞
+        if (col.kind === 'runway') continue;         // 承载面由单向平台支撑处理，避免落地时把机身弹开
         if (col.shape === 'sphere') {
           const d = wp.distanceTo(col.center);
           const rr = sp.radius + col.radius;
@@ -1161,7 +1175,9 @@ export class Aircraft {
           if (Math.abs(wp.y - col.center.y) > col.halfExtents.y + sp.radius + 1) continue;
           if (Math.abs(wp.z - col.center.z) > col.halfExtents.z + sp.radius + 1) continue;
           const impulse = resolveSphereBox(body, wp, sp.radius, {
-            center: col.center, halfExtents: col.halfExtents, quaternion: col.quaternion || null,
+            center: col.center,
+            halfExtents: col.localHalfExtents || col.halfExtents,
+            quaternion: col.quaternion || null,
           }, 0.25, 0.5);
           if (impulse > 0.5) {
             const strength = impulse * body.mass * 0.5;

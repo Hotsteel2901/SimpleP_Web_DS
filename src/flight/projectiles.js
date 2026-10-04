@@ -139,7 +139,24 @@ function segAabbT(ax, ay, az, bx, by, bz, cx, cy, cz, hx, hy, hz, pad) {
   return tmin;
 }
 
-/** 点到碰撞体表面的距离（球/盒；盒按 AABB 处理，忽略可能的旋转） */
+/** 线段 vs 盒体；旋转盒先转到局部坐标，未旋转盒保持 AABB 快路径。 */
+function segColliderT(ax, ay, az, bx, by, bz, c, pad = 0) {
+  const h = c.localHalfExtents || c.halfExtents;
+  if (!h) return -1;
+  if (!c.localHalfExtents) {
+    return segAabbT(ax, ay, az, bx, by, bz,
+      c.center.x, c.center.y, c.center.z, h.x, h.y, h.z, pad);
+  }
+  const cos = c.platformCos, sin = c.platformSin;
+  const axw = ax - c.center.x, azw = az - c.center.z;
+  const bxw = bx - c.center.x, bzw = bz - c.center.z;
+  const lax = cos * axw - sin * azw, laz = sin * axw + cos * azw;
+  const lbx = cos * bxw - sin * bzw, lbz = sin * bxw + cos * bzw;
+  return segAabbT(lax, ay - c.center.y, laz, lbx, by - c.center.y, lbz,
+    0, 0, 0, h.x, h.y, h.z, pad);
+}
+
+/** 点到碰撞体表面的距离（球/盒；旋转盒在局部坐标中计算）。 */
 function pointColliderDist(px, py, pz, c) {
   const ctr = c.center;
   if (!ctr) return Infinity;
@@ -147,14 +164,20 @@ function pointColliderDist(px, py, pz, c) {
     const dx = px - ctr.x, dy = py - ctr.y, dz = pz - ctr.z;
     return Math.max(0, Math.sqrt(dx * dx + dy * dy + dz * dz) - (c.radius || 0));
   }
-  const h = c.halfExtents;
+  const h = c.localHalfExtents || c.halfExtents;
   if (!h) {
     const dx = px - ctr.x, dy = py - ctr.y, dz = pz - ctr.z;
     return Math.sqrt(dx * dx + dy * dy + dz * dz);
   }
-  const dx = Math.max(0, Math.abs(px - ctr.x) - h.x);
+  let localX = px - ctr.x, localZ = pz - ctr.z;
+  if (c.localHalfExtents) {
+    const dx = localX, dz = localZ;
+    localX = c.platformCos * dx - c.platformSin * dz;
+    localZ = c.platformSin * dx + c.platformCos * dz;
+  }
+  const dx = Math.max(0, Math.abs(localX) - h.x);
   const dy = Math.max(0, Math.abs(py - ctr.y) - h.y);
-  const dz = Math.max(0, Math.abs(pz - ctr.z) - h.z);
+  const dz = Math.max(0, Math.abs(localZ) - h.z);
   return Math.sqrt(dx * dx + dy * dy + dz * dz);
 }
 
@@ -360,10 +383,16 @@ class ColliderHash {
       miny = p.y - r; maxy = p.y + r;
       minz = p.z - r; maxz = p.z + r;
     } else {
-      const h = c.halfExtents;
+      const h = c.localHalfExtents || c.halfExtents;
       if (!h) return;
-      if (c.quaternion) {
-        // 有旋转的盒子：退化为包围球（地标接口通常给 AABB，这里只做兜底）
+      if (c.localHalfExtents && c.halfExtents) {
+        // Landmarks 同时提供局部盒与旋转后的世界 AABB；哈希按世界 AABB 入格。
+        const aabb = c.halfExtents;
+        minx = p.x - aabb.x; maxx = p.x + aabb.x;
+        miny = p.y - aabb.y; maxy = p.y + aabb.y;
+        minz = p.z - aabb.z; maxz = p.z + aabb.z;
+      } else if (c.quaternion) {
+        // 其他只提供旋转盒的接口：退化为包围球兜底。
         const r = h.length();
         minx = p.x - r; maxx = p.x + r;
         miny = p.y - r; maxy = p.y + r;
@@ -993,9 +1022,7 @@ export class ProjectileManager {
           if (c.shape === 'sphere') {
             t = segSphereT(b.prev.x, b.prev.y, b.prev.z, b.pos.x, b.pos.y, b.pos.z, ctr.x, ctr.y, ctr.z, c.radius || 0);
           } else {
-            const h = c.halfExtents;
-            if (!h) continue;
-            t = segAabbT(b.prev.x, b.prev.y, b.prev.z, b.pos.x, b.pos.y, b.pos.z, ctr.x, ctr.y, ctr.z, h.x, h.y, h.z, 0);
+            t = segColliderT(b.prev.x, b.prev.y, b.prev.z, b.pos.x, b.pos.y, b.pos.z, c, 0);
           }
           if (t >= 0 && t < hitT) { hitT = t; kind = 2; collider = c; target = null; }
         }
@@ -1164,9 +1191,7 @@ export class ProjectileManager {
           if (c.shape === 'sphere') {
             t = segSphereT(m.prev.x, m.prev.y, m.prev.z, m.pos.x, m.pos.y, m.pos.z, ctr.x, ctr.y, ctr.z, c.radius || 0);
           } else {
-            const h = c.halfExtents;
-            if (!h) continue;
-            t = segAabbT(m.prev.x, m.prev.y, m.prev.z, m.pos.x, m.pos.y, m.pos.z, ctr.x, ctr.y, ctr.z, h.x, h.y, h.z, pad);
+            t = segColliderT(m.prev.x, m.prev.y, m.prev.z, m.pos.x, m.pos.y, m.pos.z, c, pad);
           }
           if (t >= 0 && t < hitT) { hitT = t; hitCol = c; hitAc = null; }
         }
@@ -1296,9 +1321,7 @@ export class ProjectileManager {
           if (c.shape === 'sphere') {
             t = segSphereT(b.prev.x, b.prev.y, b.prev.z, b.pos.x, b.pos.y, b.pos.z, ctr.x, ctr.y, ctr.z, c.radius || 0);
           } else {
-            const h = c.halfExtents;
-            if (!h) continue;
-            t = segAabbT(b.prev.x, b.prev.y, b.prev.z, b.pos.x, b.pos.y, b.pos.z, ctr.x, ctr.y, ctr.z, h.x, h.y, h.z, 0);
+            t = segColliderT(b.prev.x, b.prev.y, b.prev.z, b.pos.x, b.pos.y, b.pos.z, c, 0);
           }
           if (t >= 0 && t < hitT) { hitT = t; col = c; }
         }
