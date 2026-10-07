@@ -36,7 +36,7 @@ for (const map of maps) {
     // 放一架飞机，跑 6 秒物理
     const craft = stockCrafts()[0];
     const ac = new Aircraft(craft, { position: sp.position.clone(), heading: sp.heading, isPlayer: true, assist: 0.5 });
-    ac.placeOnGround(terrain, sp.position.x, sp.position.z, sp.heading);
+    ac.placeOnGround(terrain, sp.position.x, sp.position.z, sp.heading, lm);
     ac.inputTarget.throttle = 1;
     const env = { terrain, landmarks: lm, gravity: 9.81, wind: new THREE.Vector3(), projectiles: null, targets: [] };
     const dt = 1 / 120;
@@ -49,9 +49,12 @@ for (const map of maps) {
     }
 
     const rings = lm.raceRings.length, items = lm.collectibles.length, anch = Object.keys(lm.anchors).length;
-    const ok = !nan && solid.length > 0 && rings + items > 0;
+    // 出生后的跑道/平台首帧不能造成任何实质伤害；此前 Stratos 的浮空岛盒体和
+    // 部分机场的跑道高度不一致，会让飞机在还没接受输入时原地损毁。
+    const spawnSafe = !ac.destroyed && ac.health > 0.98;
+    const ok = !nan && spawnSafe && solid.length > 0 && rings + items > 0;
     if (!ok) failures++;
-    console.log(`${ok ? '✅' : '❌'} ${tag.padEnd(26)} 三角≈${((terrain.mesh?.geometry?.index?.count ?? 0) / 3 | 0)} 碰撞体${String(solid.length).padStart(4)} 传感器${String(cols.length - solid.length).padStart(3)} 光环${String(rings).padStart(3)} 收集物${String(items).padStart(3)} 锚点${anch} 出生${onWater ? '水面' : '陆地'}@${gy.toFixed(0)}m 6秒后高度${(ac.body.position.y - gy).toFixed(1)}m 最低AGL${maxPen.toFixed(1)}m 健康${ac.health.toFixed(2)}${nan ? ' NaN!' : ''}`);
+    console.log(`${ok ? '✅' : '❌'} ${tag.padEnd(26)} 三角≈${((terrain.mesh?.geometry?.index?.count ?? 0) / 3 | 0)} 碰撞体${String(solid.length).padStart(4)} 传感器${String(cols.length - solid.length).padStart(3)} 光环${String(rings).padStart(3)} 收集物${String(items).padStart(3)} 锚点${anch} 出生${onWater ? '水面' : '陆地'}@${gy.toFixed(0)}m 6秒后高度${(ac.body.position.y - gy).toFixed(1)}m 最低AGL${maxPen.toFixed(1)}m 健康${ac.health.toFixed(2)}${nan ? ' NaN!' : ''}${spawnSafe ? '' : ' 出生受损!'}`);
   } catch (e) {
     failures++;
     console.log(`❌ ${tag}: ${e.message}`);
