@@ -1162,6 +1162,10 @@ export class Aircraft {
         const col = cols[i];
         if (col.destroyed || col.sensor) continue;   // 传感器（光环/触发器）不参与碰撞
         if (col.kind === 'runway') continue;         // 承载面由单向平台支撑处理，避免落地时把机身弹开
+        // 浮空岛等厚实体的顶面同样由起落架平台支撑；飞机已经在顶面附近时，
+        // 不再让机身包围球与盒体重复解算，否则出生瞬间会被“顶面 + 实体”两套
+        // 碰撞同时向上弹，造成虚假的致命撞击。侧面和下方仍保留实体碰撞。
+        if (col.oneWayTop && Number.isFinite(col.surfaceY) && wp.y >= col.surfaceY - sp.radius) continue;
         if (col.shape === 'sphere') {
           const d = wp.distanceTo(col.center);
           const rr = sp.radius + col.radius;
@@ -1603,10 +1607,46 @@ export class Aircraft {
     return { y: clamp(h, 0.3, 1e5), pitch: clamp(th, -0.22, 0.22) };
   }
 
-  /** 把飞机平稳地放到地面上（避免出生穿透） */
-  placeOnGround(terrain, x, z, heading = 0) {
+  /**
+   * 出生点正上方的可停放平台高度。
+   *
+   * 出生点通常由 Terrain 提供，机场跑道却会比地形面高几厘米到数十厘米；若仍按
+   * 地形高度摆放，起落架会在首个物理帧深深插进跑道，弹簧反冲会被误判为撞击。
+   * 浮空岛也属于这个情况：地形只提供出生区域，真正可站立的表面在岛顶。
+   * 只接受明确的承载面（runway / oneWayTop），并限制其相对地形的高度，避免把
+   * 出生点附近恰好重叠的高楼屋顶误当作起飞平台。
+   * @private
+   */
+  _spawnSurfaceAt(x, z, terrainY, landmarks) {
+    let surface = terrainY;
+    const cols = landmarks?.colliders;
+    if (!cols || !cols.length) return surface;
+    const maxRise = 80;
+    for (let i = 0; i < cols.length; i++) {
+      const c = cols[i];
+      if (c.shape !== 'box' || c.sensor || c.destroyed || (c.kind !== 'runway' && !c.oneWayTop)) continue;
+      const he = c.localHalfExtents || c.halfExtents;
+      if (!he) continue;
+      let localX = x - c.center.x, localZ = z - c.center.z;
+      if (c.localHalfExtents) {
+        const dx = localX, dz = localZ;
+        localX = c.platformCos * dx - c.platformSin * dz;
+        localZ = c.platformSin * dx + c.platformCos * dz;
+      }
+      if (Math.abs(localX) > he.x + 1 || Math.abs(localZ) > he.z + 1) continue;
+      const top = Number.isFinite(c.surfaceY)
+        ? c.surfaceY + (c.surfaceSlope || 0) * localZ
+        : c.center.y + he.y;
+      if (top >= terrainY - 1 && top <= terrainY + maxRise) surface = Math.max(surface, top);
+    }
+    return surface;
+  }
+
+  /** 把飞机平稳地放到地面或出生平台上（避免出生穿透/弹飞） */
+  placeOnGround(terrain, x, z, heading = 0, landmarks = null) {
     const pose = this.computeStaticPose();
-    const gy = terrain ? terrain.heightAt(x, z) : 0;
+    const terrainY = terrain ? terrain.heightAt(x, z) : 0;
+    const gy = this._spawnSurfaceAt(x, z, terrainY, landmarks);
     this.body.position.set(x, gy + pose.y, z);
     this.body.quaternion.setFromEuler(new THREE.Euler(pose.pitch, heading, 0, 'YXZ'));
     this.body.velocity.set(0, 0, 0);

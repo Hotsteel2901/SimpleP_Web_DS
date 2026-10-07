@@ -12,7 +12,7 @@ for (const id of ['archipelago','naval','boneyard','vetusta','raceway']) {
   const lm = new Landmarks(terrain,{kit:map.kit,seed:map.id.length*7919+map.size,density:0.7,water:true}).build(scene);
   const sp = terrain.spawnPoints[0];
   const ac = new Aircraft(stockCrafts()[0],{position:sp.position.clone(),heading:sp.heading,isPlayer:true,assist:0});
-  ac.placeOnGround(terrain,sp.position.x,sp.position.z,sp.heading);
+  ac.placeOnGround(terrain,sp.position.x,sp.position.z,sp.heading,lm);
   const p0 = ac.body.position.clone();
   // 沿跑道方向找出 400m 内的碰撞体
   const fwd = new THREE.Vector3(0,0,-1).applyQuaternion(new THREE.Quaternion().setFromEuler(new THREE.Euler(0,sp.heading,0)));

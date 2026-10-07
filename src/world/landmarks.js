@@ -1407,6 +1407,8 @@ export class Landmarks {
       platformSin: localHalfExtents ? Math.sin(heading) : 0,
       surfaceY: Number.isFinite(o.surfaceY) ? o.surfaceY : null,
       surfaceSlope: Number.isFinite(o.surfaceSlope) ? o.surfaceSlope : 0,
+      // 顶面由起落架平台逻辑单向承载；用于浮空岛等有厚实体的可降落表面。
+      oneWayTop: o.oneWayTop === true,
       destroyed: false,
     };
     this._colliders.push(c);
@@ -3751,10 +3753,17 @@ export class Landmarks {
         phase: this._rng() * 6.28, roll: 0.006, pitch: 0.005,
       });
     }
-    this.addBoxCollider('rock', x, y, z, size * 0.92, size * 0.2, size * 0.92, {
-      destructible: false, name: 'Sky island', object: g,
+    // 岛顶实际位于圆柱顶面 y + 0.08*size。旧盒体以 y 为中心、高度只有
+    // 0.4*size，顶面却高出草坪 0.12*size：出生点按地形放置后会直接埋进盒体，
+    // 被机身碰撞弹成“原地爆炸”。碰撞体对齐为顶部岩层，并把真实顶面作为单向
+    // 承载面交给起落架；倒锥最深处会和低空地形相交，不能粗暴包成整根大盒子，
+    // 否则天空公园地面出生点会被悬岛的虚拟体积从地下弹走。
+    const topY = y + size * 0.08;
+    const bottomY = y - size * 0.16;
+    this.addBoxCollider('rock', x, (topY + bottomY) * 0.5, z, size * 0.92, (topY - bottomY) * 0.5, size * 0.92, {
+      destructible: false, name: 'Sky island', object: g, surfaceY: topY, oneWayTop: true,
     });
-    this._anchor('landingPads', opts.name || 'Sky island', { x, y: y + size * 0.14, z }, Math.max(14, size * 0.6));
+    this._anchor('landingPads', opts.name || 'Sky island', { x, y: topY, z }, Math.max(14, size * 0.6));
     if (opts.poi !== false) this._poi(opts.name || 'Sky island', x, y + size * 0.3, z, 'island', size * 0.8);
     return g;
   }

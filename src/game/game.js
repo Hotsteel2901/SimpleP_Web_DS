@@ -323,7 +323,7 @@ export class Game extends Emitter {
     const gy = this.terrain ? this.terrain.heightAt(sp.position.x, sp.position.z) : 0;
     // 先做完整修复（零件/动力/武器/燃油/质量/惯性全部复位），再摆到跑道上
     p.reset(new THREE.Vector3(sp.position.x, gy + 60, sp.position.z), sp.heading || 0, 0);
-    p.placeOnGround(this.terrain, sp.position.x, sp.position.z, sp.heading || 0);
+    p.placeOnGround(this.terrain, sp.position.x, sp.position.z, sp.heading || 0, this.landmarks);
     p.body.position.y = Math.max(p.body.position.y, gy + p.getRestHeight());
     // 相机立刻跟过去，避免从残骸位置慢慢飞过来
     this.rig.initialized = false;
@@ -353,7 +353,7 @@ export class Game extends Emitter {
       return ac;
     }
     const ac = this.spawnAircraft(craftDef, { isPlayer: true, position: sp.position.clone().setY(sp.position.y + 3), heading, speed: 0, assist, fuel01: o.fuel01 });
-    ac.placeOnGround(this.terrain, sp.position.x, sp.position.z, heading);
+    ac.placeOnGround(this.terrain, sp.position.x, sp.position.z, heading, this.landmarks);
     ac.body.position.y = Math.max(ac.body.position.y, (this.terrain ? this.terrain.heightAt(sp.position.x, sp.position.z) : 0) + ac.getRestHeight() * 0.6);
     return ac;
   }
