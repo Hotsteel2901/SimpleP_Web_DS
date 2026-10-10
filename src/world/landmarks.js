@@ -815,6 +815,12 @@ export class Landmarks {
     this._customColliders = 0;
     this._bins = {};
 
+    // 飞机物理固定步长会高频查询地标。把碰撞体按 XZ 网格索引后，城市地图不必让
+    // 每个机身包围球都扫描全部数百个物体；动态船只只在 Y 轴浮动，不影响该索引。
+    this._colliderCellSize = 512;
+    this._colliderCells = new Map();
+    this._colliderQueryStamp = 0;
+
     this._initGeometry();
     this._initMaterials();
   }
@@ -826,6 +832,39 @@ export class Landmarks {
 
   /** 碰撞体数组（世界坐标纯数据，构造后基本只读）。 */
   get colliders() { return this._colliders; }
+
+  /**
+   * 查询与给定 XZ 圆形邻域相交的碰撞体，写入调用方提供的数组并返回它。
+   * Aircraft 会在每个物理步为机身碰撞球和起落架调用此方法；查询结果已去重且
+   * 做过 XZ 粗筛，避免在高密度城市中反复线性扫描整个碰撞体数组。
+   */
+  queryColliders(x, z, radius = 0, out = []) {
+    out.length = 0;
+    const cell = this._colliderCellSize;
+    const cells = this._colliderCells;
+    if (!cells?.size) return out;
+    const r = Math.max(0, radius || 0);
+    const minX = Math.floor((x - r) / cell), maxX = Math.floor((x + r) / cell);
+    const minZ = Math.floor((z - r) / cell), maxZ = Math.floor((z + r) / cell);
+    // 用单调查询号去重：横跨多个格子的跑道/航母只会返回一次。
+    const stamp = ++this._colliderQueryStamp;
+    for (let ix = minX; ix <= maxX; ix++) {
+      for (let iz = minZ; iz <= maxZ; iz++) {
+        const list = cells.get(ix + ':' + iz);
+        if (!list) continue;
+        for (let i = 0; i < list.length; i++) {
+          const c = list[i];
+          if (c._queryStamp === stamp) continue;
+          c._queryStamp = stamp;
+          const h = c.shape === 'sphere' ? c.radius : c.halfExtents?.x;
+          const d = c.shape === 'sphere' ? c.radius : c.halfExtents?.z;
+          if (h == null || d == null || Math.abs(c.center.x - x) > h + r || Math.abs(c.center.z - z) > d + r) continue;
+          out.push(c);
+        }
+      }
+    }
+    return out;
+  }
 
   /** 竞速圆环（按飞行顺序）。 */
   get raceRings() { return this._rings; }
@@ -1370,6 +1409,24 @@ export class Landmarks {
   // 碰撞体
   // ===========================================================================
 
+  /** 将碰撞体登记到其覆盖的 XZ 网格（构建期调用，运行期零分配查询）。 */
+  _indexCollider(c) {
+    const cell = this._colliderCellSize;
+    const hx = c.shape === 'sphere' ? c.radius : c.halfExtents?.x;
+    const hz = c.shape === 'sphere' ? c.radius : c.halfExtents?.z;
+    if (hx == null || hz == null) return;
+    const minX = Math.floor((c.center.x - hx) / cell), maxX = Math.floor((c.center.x + hx) / cell);
+    const minZ = Math.floor((c.center.z - hz) / cell), maxZ = Math.floor((c.center.z + hz) / cell);
+    for (let ix = minX; ix <= maxX; ix++) {
+      for (let iz = minZ; iz <= maxZ; iz++) {
+        const key = ix + ':' + iz;
+        let list = this._colliderCells.get(key);
+        if (!list) { list = []; this._colliderCells.set(key, list); }
+        list.push(c);
+      }
+    }
+  }
+
   /** 世界坐标盒碰撞体；oriented=true 时 halfExtents 保存旋转后的世界 AABB。 */
   addBoxCollider(kind, cx, cy, cz, hx, hy, hz, o = {}) {
     if (this._colliders.length >= this.maxColliders) { this._skippedColliders++; return null; }
@@ -1412,6 +1469,7 @@ export class Landmarks {
       destroyed: false,
     };
     this._colliders.push(c);
+    this._indexCollider(c);
     if (c.object) c.object.userData.collider = c;
     if (o.floating) this._addBobber(c, cy, o);
     this._customColliders++;
@@ -1466,6 +1524,7 @@ export class Landmarks {
       destroyed: false,
     };
     this._colliders.push(c);
+    this._indexCollider(c);
     if (c.object) c.object.userData.collider = c;
     if (o.floating) this._addBobber(c, cy, o);
     this._customColliders++;
@@ -1942,6 +2001,8 @@ export class Landmarks {
     this._noBuild.length = 0;
     this._pois.length = 0;
     this._bins = {};
+    this._colliderCells.clear();
+    this._colliderQueryStamp = 0;
     if (typeof this.root.clear === 'function') this.root.clear();
     this._ringCurve = null;
     this._built = false;

@@ -73,6 +73,13 @@ for (let i = 0; i < steps; i++) {
       p.controls.fire1 = true;
     }
     game.update(dt);
+    // 无头场景用 AI 接管玩家，飞行生存是有效性的一部分；过去这里只检查
+    // JS 异常，因而“已坠毁但没有抛错”的空战回归会被误判为通过。
+    if (p?.destroyed) {
+      errors++;
+      console.log(`❌ 玩家飞机坠毁 @ ${(i * dt).toFixed(1)}s（${p.destroyCause || 'unknown'}）`);
+      break;
+    }
     if (i % (60 * 15) === 0) {
       const s = p?.state;
       console.log(`  t=${(i * dt).toFixed(0)}s 高度=${s ? s.altitudeAGL.toFixed(0) : '--'}m 速度=${s ? s.speed.toFixed(0) : '--'}m/s 健康=${s ? s.health01.toFixed(2) : '--'} 弹药事件=${game.projectiles.count} 任务进度=${game.mission.progress.current}/${game.mission.progress.total}${game.mission.finished ? ' [已结束:' + (game.mission.success ? '成功' : '失败') + ']' : ''}`);

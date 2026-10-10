@@ -74,13 +74,34 @@ export class AIPilot {
       desired = r.dir;
     }
 
-    // 地形规避：除了看高度，还要看「还有几秒撞地」（俯冲速度大时 AGL 再高也来不及）
-    const minAgl = 90 + (1 - this.skill) * 90;
+    // 地形规避：除了看当前 AGL / 垂直速度，还要沿当前速度方向预看地形。
+    // 原先只在脚下变低后才拉起；空战追逐时目标经常在山脊另一侧，AI 即使在
+    // 水平飞行也会在数秒后撞山。提前采样 3 个点，让它能先爬升再越岭。
+    // AI 比玩家预留更高的地形净空：它还要完成滚转改平和舵面响应，等到
+    // 90m 才反应会让重型战机在山地空战中来不及拉起。
+    const minAgl = 150 + (1 - this.skill) * 140;
     const vs = ac.body.velocity.y;
+    const velocity = ac.body.velocity;
+    const horizontalSpeed = Math.hypot(velocity.x, velocity.z);
+    let clearanceAhead = agl;
+    if (terrain && horizontalSpeed > 8) {
+      const lookTime = clamp(4.0 + horizontalSpeed / 22, 4.5, 10.0);
+      for (let i = 1; i <= 3; i++) {
+        const f = i / 3;
+        const t = lookTime * f;
+        const px = ac.body.position.x + velocity.x * t;
+        const pz = ac.body.position.z + velocity.z * t;
+        // 保守估计：只按当前垂直速度外推，绝不假设“之后一定会拉起来”。
+        const projectedY = ac.body.position.y + Math.min(vs, 4) * t;
+        clearanceAhead = Math.min(clearanceAhead, projectedY - terrain.heightAt(px, pz));
+      }
+    }
     const tti = vs < -1 ? agl / -vs : Infinity;
-    const pullup = (agl < minAgl && vs < 6) || tti < 4.5 || (agl < 220 && vs < -25);
+    const terrainAhead = clearanceAhead < minAgl * 1.8 && (vs < 15 || clearanceAhead < minAgl);
+    const pullup = (agl < minAgl && vs < 6) || tti < 4.5 || (agl < 220 && vs < -25) || terrainAhead;
     if (pullup) {
-      desired = _v2.copy(desired).normalize().add(_v3.set(0, 1.4, 0)).normalize();
+      const urgency = clamp01((minAgl * 1.8 - clearanceAhead) / Math.max(1, minAgl));
+      desired = _v2.copy(desired).normalize().add(_v3.set(0, 1.15 + urgency * 0.85, 0)).normalize();
       throttle = 1;
       this.state = 'pullup';
     }
@@ -89,7 +110,9 @@ export class AIPilot {
     // 保命机动不受过载限制器的约束（否则高速俯冲时 AI 拉不起来，一头扎进地里）
     if (pullup) {
       ac.inputTarget.pitch = 1;
-      ac.inputTarget.roll = damp(ac.inputTarget.roll || 0, 0, 3, dt);
+      // 卸掉滚转/偏航，先把升力向上。低空仍带着大坡度拉杆只会拐进地面。
+      ac.inputTarget.roll = damp(ac.inputTarget.roll || 0, 0, 9, dt);
+      ac.inputTarget.yaw = damp(ac.inputTarget.yaw || 0, 0, 6, dt);
     }
     ac.inputTarget.throttle = clamp01(throttle);
     ac.controls.fire1 = fire;

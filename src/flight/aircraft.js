@@ -290,6 +290,9 @@ export class Aircraft {
     this.cargoParts = craft.parts.filter((p) => PART_DEFS[p.def]?.cargo).map((p) => p.uid);
     this.radius = Math.max(1.5, stats.size.length() * 0.42);
     this.collisionSpheres = this._buildCollisionSpheres(stats, 4);
+    // 地标空间索引的查询结果缓存：物理热路径不再为每个包围球分配数组。
+    this._collisionCandidates = [];
+    this._platformCandidates = [];
     // 机腹/尾椎接触点：正常滑跑时离地，抬轮过度会“尾椎擦地”被压住，
     // 起落架全没了也能用肚子迫降（旧实现只有包围球，抬轮 20°+ 会直接翻过去）
     this.bellyPoints = this._buildBellyPoints(stats);
@@ -1031,8 +1034,11 @@ export class Aircraft {
   _platformAt(x, z, wheelY, env) {
     const lm = env?.landmarks;
     if (!lm) return null;
-    const cols = lm.colliders;
-    if (!cols || !cols.length) return null;
+    const allCols = lm.colliders;
+    if (!allCols || !allCols.length) return null;
+    const cols = lm.queryColliders
+      ? lm.queryColliders(x, z, 1, this._platformCandidates)
+      : allCols;
     let best = null;
     for (let i = 0; i < cols.length; i++) {
       const c = cols[i];
@@ -1154,10 +1160,15 @@ export class Aircraft {
 
   checkLandmarkCollisions(env, dt) {
     const body = this.body;
-    const cols = env.landmarks.colliders;
-    if (!cols || !cols.length) return;
+    const landmarks = env.landmarks;
+    const allCols = landmarks.colliders;
+    if (!allCols || !allCols.length) return;
     for (const sp of this.collisionSpheres) {
       const wp = _v.copy(sp.center).applyQuaternion(body.quaternion).add(body.position);
+      // Landmarks 提供空间索引时只检查附近候选；外部/旧的 landmarks 桩仍回退全量数组。
+      const cols = landmarks.queryColliders
+        ? landmarks.queryColliders(wp.x, wp.z, sp.radius + 1, this._collisionCandidates)
+        : allCols;
       for (let i = 0; i < cols.length; i++) {
         const col = cols[i];
         if (col.destroyed || col.sensor) continue;   // 传感器（光环/触发器）不参与碰撞

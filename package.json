@@ -8,7 +8,7 @@
     "dev": "node server.js",
     "build": "node scripts/build.mjs",
     "check": "node scripts/check.mjs",
-    "test": "node scripts/check.mjs && node tests/damage-test.mjs && node tests/reset-test.mjs && node tests/flight-test.mjs 0 && node tests/sky-texture-test.mjs && node tests/terrain-scale-test.mjs && node tests/world-surface-test.mjs && node tests/integration.mjs && node tests/headless.mjs archipelago combat && node tests/net-server.mjs && node tests/mp-e2e.mjs",
+    "test": "node scripts/check.mjs && node tests/damage-test.mjs && node tests/reset-test.mjs && node tests/flight-test.mjs 0 && node tests/ai-safety-test.mjs && node tests/sky-texture-test.mjs && node tests/terrain-scale-test.mjs && node tests/world-surface-test.mjs && node tests/integration.mjs && node tests/headless.mjs archipelago combat && node tests/net-server.mjs && node tests/mp-e2e.mjs",
     "test:flight": "node tests/flight-test.mjs",
     "test:sky": "node tests/sky-texture-test.mjs",
     "test:terrain": "node tests/terrain-scale-test.mjs",

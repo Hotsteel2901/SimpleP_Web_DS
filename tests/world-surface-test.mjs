@@ -54,6 +54,9 @@ function assertRenderable(mesh, name) {
   assert.ok(runway.halfExtents.x > runway.localHalfExtents.x, 'broad phase should use rotated world bounds');
   const runwayPoint = localToWorld(airport.x, airport.z, heading, 0, 130);
   assert.equal(platformAt(lm, runwayPoint.x, runwayPoint.z, runway.surfaceY + 1), runway.surfaceY);
+  const nearby = lm.queryColliders(runwayPoint.x, runwayPoint.z, 2, []);
+  assert.ok(nearby.includes(runway), '空间索引应返回脚下跑道');
+  assert.equal(new Set(nearby).size, nearby.length, '跨多个网格的碰撞体在查询结果中不得重复');
 
   const taxiway = lm.colliders.find((c) => c.name === 'Taxiway');
   assert.ok(taxiway, 'taxiway should have a collider');
