@@ -2733,24 +2733,32 @@ export class Builder {
   /** 查找某个零件在指定轴上的镜像伙伴 @private */
   _mirrorPartner(part, axis) {
     try {
+      if (!part || !part.pos) return null;
       const parts = this._craft.parts || [];
       if (axis === 'x' && Math.abs(toNum(part.pos?.[0], 0)) < 0.02) return null;
       if (axis === 'y' && Math.abs(toNum(part.pos?.[1], 0)) < 0.02) return null;
       const px = toNum(part.pos?.[0], 0), py = toNum(part.pos?.[1], 0), pz = toNum(part.pos?.[2], 0);
+      // 角度必须按 360° 回绕比较：镜像后的 -90° 会被 normDeg 归一成 270°，
+      // 旧实现用「两角相加≈0」判断，270+90=360 会被误判成不相等，于是
+      // 已经镜像好的零件找不到伙伴，再次点「镜像」就会叠出一份重复零件。
+      const sameAngle = (a, b) => {
+        const d = Math.abs(normDeg(a - b));
+        return Math.min(d, 360 - d) <= ROT_EPS;
+      };
       for (const q of parts) {
         if (q === part || q.def !== part.def) continue;
         const qx = toNum(q.pos?.[0], 0), qy = toNum(q.pos?.[1], 0), qz = toNum(q.pos?.[2], 0);
         if (Math.abs(qz - pz) > POS_EPS) continue;
         if (axis === 'x') {
           if (Math.abs(qx + px) > POS_EPS || Math.abs(qy - py) > POS_EPS) continue;
-          if (Math.abs(toNum(q.rot?.[0], 0) - toNum(part.rot?.[0], 0)) > ROT_EPS) continue;
-          if (Math.abs(toNum(q.rot?.[1], 0) + toNum(part.rot?.[1], 0)) > ROT_EPS) continue;
-          if (Math.abs(toNum(q.rot?.[2], 0) + toNum(part.rot?.[2], 0)) > ROT_EPS) continue;
+          if (!sameAngle(toNum(q.rot?.[0], 0), toNum(part.rot?.[0], 0))) continue;
+          if (!sameAngle(toNum(q.rot?.[1], 0), -toNum(part.rot?.[1], 0))) continue;
+          if (!sameAngle(toNum(q.rot?.[2], 0), -toNum(part.rot?.[2], 0))) continue;
         } else {
           if (Math.abs(qy + py) > POS_EPS || Math.abs(qx - px) > POS_EPS) continue;
-          if (Math.abs(toNum(q.rot?.[0], 0) + toNum(part.rot?.[0], 0)) > ROT_EPS) continue;
-          if (Math.abs(toNum(q.rot?.[1], 0) - toNum(part.rot?.[1], 0)) > ROT_EPS) continue;
-          if (Math.abs(toNum(q.rot?.[2], 0) + toNum(part.rot?.[2], 0)) > ROT_EPS) continue;
+          if (!sameAngle(toNum(q.rot?.[0], 0), -toNum(part.rot?.[0], 0))) continue;
+          if (!sameAngle(toNum(q.rot?.[1], 0), toNum(part.rot?.[1], 0))) continue;
+          if (!sameAngle(toNum(q.rot?.[2], 0), -toNum(part.rot?.[2], 0))) continue;
         }
         return q;
       }
@@ -3757,12 +3765,20 @@ export class Builder {
   _mirrorSelected() {
     const sel = this.selectedParts();
     if (!sel.length) { Toast.push('先选中零件', { kind: 'info', duration: 1400 }); return; }
+    // 位于镜像平面上的零件（机身/居中机翼）没有“另一侧”，对它做镜像只会
+    // 在同一坐标叠出一份完全重合的副本；先过滤掉。
+    const centered = (p) => Math.abs(toNum(p.pos?.[0], 0)) < 0.02;
+    const targets = sel.filter((p) => !centered(p));
+    if (!targets.length) {
+      Toast.push('零件已在镜像平面上，无需镜像', { kind: 'info', duration: 1600 });
+      return;
+    }
     this._pushHistory();
     try {
-      const allMirrored = sel.every((p) => !!this._mirrorPartner(p, 'x'));
+      const allMirrored = targets.every((p) => !!this._mirrorPartner(p, 'x'));
       if (allMirrored) {
         const doomed = new Set();
-        for (const p of sel) {
+        for (const p of targets) {
           const m = this._mirrorPartner(p, 'x');
           if (m && !this._selUids.has(m.uid)) doomed.add(m);
         }
@@ -3770,7 +3786,7 @@ export class Builder {
         Toast.push(`已移除 ${doomed.size} 个镜像零件`, { kind: 'success', duration: 1500 });
       } else {
         const created = [];
-        for (const p of sel) {
+        for (const p of targets) {
           if (this._mirrorPartner(p, 'x')) continue;
           const c = this._makeMirrorX(p);
           if (c) created.push(c);

@@ -82,6 +82,20 @@ function assertRenderable(mesh, name) {
   lm.dispose();
 }
 
+// 浮空岛：顶面仍是可降落平台，但倒锥岩体必须有侧面/底面碰撞（不能穿模）。
+{
+  const lm = new Landmarks(null, { seed: 31, density: 0, maxColliders: 256, seaLevel: 0 });
+  lm.buildFloatingIsland(0, 500, 0, 100, { trees: 0, bob: false });
+  const top = lm.colliders.find((c) => c.name === 'Sky island');
+  assert.ok(top, '浮空岛顶面碰撞体应存在');
+  assert.equal(top.oneWayTop, true, '顶面应标记为单向承载面');
+  assert.equal(platformAt(lm, 0, 0, top.surfaceY + 1), top.surfaceY, '顶面仍应能承载起落架');
+  const rocks = lm.colliders.filter((c) => c.name === 'Sky island rock');
+  assert.ok(rocks.length >= 4, `倒锥岩体应有多层碰撞，实际 ${rocks.length}`);
+  assert.ok(rocks.every((c) => c.center.y < top.surfaceY), '岩体碰撞必须在顶面以下');
+  lm.dispose();
+}
+
 // 建筑网格及其碰撞数据仍挂在场景根节点中。
 {
   const lm = new Landmarks(null, { seed: 23, density: 0, maxColliders: 128 });

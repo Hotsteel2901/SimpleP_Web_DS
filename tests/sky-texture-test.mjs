@@ -165,6 +165,17 @@ t('遍历 0→1 整圈 timeOfDay，applyTimeOfDay 全部安全', () => {
   dome.dispose?.();
 });
 
+t('天空球跟随相机高度（高空不会钻出天空球）', () => {
+  const scene = new THREE.Scene();
+  const dome = new SkyDome(scene, { timeOfDay: 0.5, radius: 8000 });
+  const cam = new THREE.PerspectiveCamera();
+  dome.update(1 / 60, cam, { x: 1200, y: 9000, z: -300 });
+  assert.equal(dome.skyMesh.position.y, 9000, '天空球应跟随相机高度');
+  assert.equal(dome.skyMesh.position.x, 1200);
+  assert.equal(dome.skyMesh.position.z, -300);
+  dome.dispose?.();
+});
+
 t('pmrem 为 null 时 _updateEnv 安全返回', () => {
   const scene = new THREE.Scene();
   const dome = new SkyDome(scene, { timeOfDay: 0.5 });

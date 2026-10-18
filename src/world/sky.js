@@ -83,18 +83,21 @@ function makeCloudTexture(seed = 5, size = 512) {
 
 /* ---------------------------------------------------------------- 天空球 */
 const SKY_VERT = /* glsl */`
-varying vec3 vWorld;
+varying vec3 vDir;
 void main() {
-  vWorld = (modelMatrix * vec4(position, 1.0)).xyz;
+  // 用球体局部坐标做方向：天空球始终跟随相机（含高度），
+  // 若仍用世界坐标，飞到高空/远海时方向会从世界原点算起，地平线会歪，
+  // 飞得比天空球顶还高时还会看到“天空边界”。
+  vDir = position;
   gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
 }`;
 const SKY_FRAG = /* glsl */`
 uniform vec3 uTop, uHor, uBot, uSun, uSunDir;
 uniform float uSunI, uStar, uTime;
-varying vec3 vWorld;
+varying vec3 vDir;
 float hash(vec3 p){ p = fract(p * 0.3183099 + vec3(0.1,0.2,0.3)); p *= 17.0; return fract(p.x*p.y*p.z*(p.x+p.y+p.z)); }
 void main() {
-  vec3 dir = normalize(vWorld);
+  vec3 dir = normalize(vDir);
   float h = clamp(dir.y, -1.0, 1.0);
   vec3 col;
   if (h > 0.0) col = mix(uHor, uTop, pow(h, 0.55));
@@ -287,7 +290,9 @@ export class SkyDome {
     this.uniforms.uTime.value += dt;
     const c = focus || camera?.position;
     if (c) {
-      this.skyMesh.position.set(c.x, 0, c.z);
+      // 天空球整体跟随相机（包括高度）：原先只跟 x/z，飞到 7~13km 以上
+      // 会钻出天空球，画面变成黑/出现“空气墙”。云层仍固定在各自高度。
+      this.skyMesh.position.copy(c);
       // 让天空球足够大以覆盖远裁剪面
       if (this.cloudLayer) this.cloudLayer.position.set(c.x, this.cloudLayer.position.y, c.z);
       if (this.cloudLayer2) this.cloudLayer2.position.set(c.x, this.cloudLayer2.position.y, c.z);

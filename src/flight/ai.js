@@ -77,8 +77,9 @@ export class AIPilot {
     // 地形规避：除了看当前 AGL / 垂直速度，还要沿当前速度方向预看地形。
     // 原先只在脚下变低后才拉起；空战追逐时目标经常在山脊另一侧，AI 即使在
     // 水平飞行也会在数秒后撞山。提前采样 3 个点，让它能先爬升再越岭。
-    // AI 比玩家预留更高的地形净空：它还要完成滚转改平和舵面响应，等到
-    // 90m 才反应会让重型战机在山地空战中来不及拉起。
+    // 注意：真正把 AI 摔下去的是下面保命机动的“无条件满拉杆”，不是这里的
+    // 触发条件。低速/贴地时 pitch=1 会让飞机爬到 70°+、空速掉进失速，再从
+    // 低空掉下来。触发阈值保持原样，拉杆量改为按空速/迎角限制（见下）。
     const minAgl = 150 + (1 - this.skill) * 140;
     const vs = ac.body.velocity.y;
     const velocity = ac.body.velocity;
@@ -107,9 +108,22 @@ export class AIPilot {
     }
 
     this._steer(desired, dt);
-    // 保命机动不受过载限制器的约束（否则高速俯冲时 AI 拉不起来，一头扎进地里）
+    // 保命机动不受过载限制器的约束（否则高速俯冲时 AI 拉不起来，一头扎进地里）。
+    // 但也不能无条件满拉：低速时满拉杆会让飞机失速，反而从低空掉下去。
+    // 用空速与当前迎角给出“还能拉多少”的限制，失速时先松杆恢复。
     if (pullup) {
-      ac.inputTarget.pitch = 1;
+      const speed = ac.body.velocity.length();
+      const stallGuard = clamp01((speed - 30) / 35);
+      let safePitch = 0.25 + 0.75 * stallGuard;
+      if (ac.state.aoa > 0.22) safePitch = Math.min(safePitch, clamp01(1 - (ac.state.aoa - 0.22) * 6));
+      if (ac.state.stall) safePitch = Math.min(safePitch, -0.1);
+      // 刚离地/贴地低速时，首要任务是加速而不是把机头拉成 60°：
+      // 低空大仰角会把空速吃光，接下来既爬不上去也滚不回来。
+      // 只有速度足够时才允许大角度爬升。
+      if (agl < 80 && speed < 70) {
+        safePitch = Math.min(safePitch, 0.2 + 0.35 * clamp01((speed - 30) / 40));
+      }
+      ac.inputTarget.pitch = safePitch;
       // 卸掉滚转/偏航，先把升力向上。低空仍带着大坡度拉杆只会拐进地面。
       ac.inputTarget.roll = damp(ac.inputTarget.roll || 0, 0, 9, dt);
       ac.inputTarget.yaw = damp(ac.inputTarget.yaw || 0, 0, 6, dt);

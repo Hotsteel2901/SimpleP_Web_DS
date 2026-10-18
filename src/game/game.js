@@ -73,13 +73,17 @@ export class CameraRig {
       if (desired.y < gy + 2.5) desired.y = gy + 2.5;
       const k = 1 - Math.exp(-this.smooth * dt);
       cam.position.lerp(desired, k);
-      this.camera.lookAt(_v2.copy(body.position).addScaledVector(body.velocity, 0.06));
+      // 相机看向机头前方，而不是速度方向：侧风/侧滑时速度方向与机头有夹角，
+      // 按速度看会把机头永远压在画面一侧，看起来像“飞机斜着飞”。
+      const fwd = _v3.set(0, 0, -1).applyQuaternion(body.quaternion);
+      const lookTarget = _v2.copy(body.position).addScaledVector(fwd, 40 + speed * 0.12);
+      this.camera.lookAt(lookTarget);
       // 滚转混合到相机（30%）
       _q.copy(body.quaternion);
       _e.setFromQuaternion(_q, 'YXZ');
       _e.z *= 0.32;
       const blend = new THREE.Quaternion().setFromEuler(_e);
-      const look = new THREE.Matrix4().lookAt(cam.position, _v2.copy(body.position).addScaledVector(body.velocity, 0.06), _v3.set(0, 1, 0).applyQuaternion(blend));
+      const look = new THREE.Matrix4().lookAt(cam.position, lookTarget, _v3.set(0, 1, 0).applyQuaternion(blend));
       const q2 = new THREE.Quaternion().setFromRotationMatrix(look);
       cam.quaternion.slerp(q2, 1 - Math.exp(-8 * dt));
       this.fov = this.baseFov + clamp(speed * 0.06, 0, 16);

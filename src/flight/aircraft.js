@@ -1042,7 +1042,7 @@ export class Aircraft {
     let best = null;
     for (let i = 0; i < cols.length; i++) {
       const c = cols[i];
-      if (c.shape !== 'box' || c.sensor || c.destroyed) continue;
+      if (c.shape !== 'box' || c.sensor || c.destroyed || c.noPlatform) continue;
       const he = c.localHalfExtents || c.halfExtents; if (!he) continue;
       let localX = x - c.center.x, localZ = z - c.center.z;
       if (c.localHalfExtents) {
@@ -1176,7 +1176,9 @@ export class Aircraft {
         // 浮空岛等厚实体的顶面同样由起落架平台支撑；飞机已经在顶面附近时，
         // 不再让机身包围球与盒体重复解算，否则出生瞬间会被“顶面 + 实体”两套
         // 碰撞同时向上弹，造成虚假的致命撞击。侧面和下方仍保留实体碰撞。
-        if (col.oneWayTop && Number.isFinite(col.surfaceY) && wp.y >= col.surfaceY - sp.radius) continue;
+        // oneWayTop 只作为起落架“可降落平台”，不参与机身碰撞；
+        // 浮空岛的实体侧面/底面由 buildFloatingIsland 里的倒锥岩体碰撞体负责。
+        if (col.oneWayTop) continue;
         if (col.shape === 'sphere') {
           const d = wp.distanceTo(col.center);
           const rr = sp.radius + col.radius;

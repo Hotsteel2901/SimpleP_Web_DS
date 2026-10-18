@@ -459,10 +459,11 @@ ok('−/＋ 步进：位置按 step、旋转按 rotStep', () => {
   assert.ok(found.part.size[2] < s0 + 1e-9, '尺寸 − 应还原');
 });
 ok('微调带动镜像伙伴（对称开启时）', () => {
+  freshCraft();
   b.symmetry = 'x';
-  const p = b.craft.parts.find((x) => x.def === 'wing' && x.pos[0] > 0.5);
-  const m = b._mirrorPartner(p, 'x');
-  assert.ok(m, '库存机翼应有镜像');
+  const pair = findMirrorPair();
+  assert.ok(pair, '库存机应有左右对称零件');
+  const { p, m } = pair;
   b._selUids = new Set([p.uid]);
   b._refreshNudgePanel();
   const [px, mx] = [p.pos[0], m.pos[0]];
@@ -560,14 +561,46 @@ ok('鼠标不做长按（用右键）', () => {
   assert.equal(b._longPress, null);
   pointer(b, 'pointerup', { clientX: found.s.x, clientY: found.s.y, pointerType: 'mouse', button: 0 });
 });
-ok('镜像动作：补齐/移除左右镜像', () => {
-  const part = b.craft.parts.find((p) => p.def === 'wing' && p.pos[0] > 0);
-  b._selUids = new Set([part.uid]);
+ok('镜像动作：移除已有镜像 / 再补齐', () => {
+  freshCraft();
+  b.symmetry = 'x';
+  const pair = findMirrorPair();
+  assert.ok(pair, '库存机应有左右对称零件');
+  const { p, m } = pair;
+  b._selUids = new Set([p.uid]);
   const n0 = b.craft.parts.length;
-  const hadMirror = !!b._mirrorPartner(part, 'x');
   b._mirrorSelected();
-  if (hadMirror) assert.ok(b.craft.parts.length <= n0);
-  else assert.equal(b.craft.parts.length, n0 + 1);
+  assert.equal(b.craft.parts.includes(m), false, '已有镜像时应移除伙伴');
+  assert.equal(b.craft.parts.length, n0 - 1);
+  b._selUids = new Set([p.uid]);
+  b._mirrorSelected();
+  assert.equal(b.craft.parts.length, n0, '没有镜像时应补齐一份');
+  assert.ok(b._mirrorPartner(p, 'x'), '补齐后应重新找到镜像伙伴');
+});
+
+ok('居中零件点“镜像”不会叠出重合副本', () => {
+  freshCraft();
+  b.symmetry = 'x';
+  const p = b.craft.parts.find((x) => x.def === 'wing' && Math.abs(x.pos[0]) < 0.02);
+  assert.ok(p, '库存机应有中线机翼');
+  b._selUids = new Set([p.uid]);
+  const n0 = b.craft.parts.length;
+  b._mirrorSelected();
+  assert.equal(b.craft.parts.length, n0, '中线零件没有“另一侧”，不应复制');
+});
+
+ok('镜像角度回绕：+90° 与 -90°(=270°) 也能配对', () => {
+  freshCraft();
+  b.symmetry = 'x';
+  const p = b.craft.parts.find((x) => Math.abs(x.pos[0]) > 0.5);
+  assert.ok(p);
+  const q = clone(p);
+  q.uid = b._allocUid();
+  q.pos[0] = -p.pos[0];
+  p.rot[1] = 90;
+  q.rot[1] = 270;
+  b.craft.parts.push(q);
+  assert.equal(b._mirrorPartner(p, 'x'), q, '270° 应视为 -90° 的镜像');
 });
 
 /* ------------------------------------------------------------------ 双指手势 */
@@ -743,6 +776,14 @@ function freshCraft() {
   installFakeGL(b);
   b.setTouchLayout(false);
 }
+/** 在库存机里找一对真正左右对称的零件（机身中线上的机翼没有镜像伙伴）。 */
+function findMirrorPair() {
+  for (const p of b.craft.parts) {
+    const m = b._mirrorPartner(p, 'x');
+    if (m && m !== p) return { p, m };
+  }
+  return null;
+}
 ok('镜像 X 放置生成左右两份（位置/旋转镜像）', () => {
   freshCraft();
   b.symmetry = 'x';
@@ -771,9 +812,9 @@ ok('镜像 X 且 x≈0 只生成一份', () => {
 ok('方向键微调带动镜像伙伴', () => {
   freshCraft();
   b.symmetry = 'x';
-  const p = b.craft.parts.find((x) => x.def === 'wing' && x.pos[0] > 0.5);
-  const m = b._mirrorPartner(p, 'x');
-  assert.ok(m, '库存机翼应有镜像');
+  const pair = findMirrorPair();
+  assert.ok(pair, '库存机应有左右对称零件');
+  const { p, m } = pair;
   b._selUids = new Set([p.uid]);
   const [px, mx] = [p.pos[0], m.pos[0]];
   b._nudgeSelection(0.25, 0.5, 0);
@@ -782,10 +823,11 @@ ok('方向键微调带动镜像伙伴', () => {
   assert.equal(m.pos[1], p.pos[1]);
 });
 ok('镜像删除成对移除', () => {
+  freshCraft();
   b.symmetry = 'x';
-  const p = b.craft.parts.find((x) => x.def === 'wing' && x.pos[0] > 0.5);
-  const m = b._mirrorPartner(p, 'x');
-  assert.ok(p && m, '库存机翼应有镜像');
+  const pair = findMirrorPair();
+  assert.ok(pair, '库存机应有左右对称零件');
+  const { p, m } = pair;
   b._selUids = new Set([p.uid]);
   const n0 = b.craft.parts.length;
   b.deleteSelected();

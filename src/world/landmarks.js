@@ -811,6 +811,7 @@ export class Landmarks {
     // 生成序号
     this._colliderSeq = 0;
     this._noBuild = [];   // 禁区（跑道/城区内部不种树）
+    this._runwayZones = []; // 跑道起飞净空走廊（矩形，随 heading 旋转）
     this._pois = [];      // 主要兴趣点 { name, position, kind }
     this._customColliders = 0;
     this._bins = {};
@@ -1402,6 +1403,19 @@ export class Landmarks {
       const dx = x - b.x, dz = z - b.z;
       if (dx * dx + dz * dz < b.r * b.r) return true;
     }
+    return this._inRunwayClearance(x, z);
+  }
+
+  /** 是否落在跑道起飞/进近净空走廊内（沿跑道 heading 的旋转矩形）。 */
+  _inRunwayClearance(x, z, margin = 0) {
+    const zones = this._runwayZones;
+    for (let i = 0; i < zones.length; i++) {
+      const c = zones[i];
+      const dx = x - c.x, dz = z - c.z;
+      const f = -dx * c.sin - dz * c.cos;       // 沿跑道前向
+      const r = dx * c.cos - dz * c.sin;        // 横向
+      if (Math.abs(f) <= c.halfLen + margin && Math.abs(r) <= c.halfWidth + margin) return true;
+    }
     return false;
   }
 
@@ -1466,6 +1480,8 @@ export class Landmarks {
       surfaceSlope: Number.isFinite(o.surfaceSlope) ? o.surfaceSlope : 0,
       // 顶面由起落架平台逻辑单向承载；用于浮空岛等有厚实体的可降落表面。
       oneWayTop: o.oneWayTop === true,
+      // 内部岩层/装饰盒只参与碰撞，不应被起落架当成“可停放屋顶”。
+      noPlatform: o.noPlatform === true,
       destroyed: false,
     };
     this._colliders.push(c);
@@ -1999,6 +2015,7 @@ export class Landmarks {
     this._colliders.length = 0;
     this._anchors = { cargo: [], dropzones: [], targets: [], checkpoints: [], landingPads: [] };
     this._noBuild.length = 0;
+    this._runwayZones.length = 0;
     this._pois.length = 0;
     this._bins = {};
     this._colliderCells.clear();
@@ -2351,6 +2368,13 @@ export class Landmarks {
     const slabTop = baseY + 0.35;
     const name = opts.name || 'Airport';
     this._reserve(x, z, Math.max(len, 700) * 0.75);
+    // 起降净空走廊：沿跑道方向再延伸 900m、横向 ±(半宽+140m)。
+    // 城市/高架桥/塔楼都走 _isReserved，因此会自动给进近航线让出缺口。
+    this._runwayZones.push({
+      x, z, sin, cos,
+      halfLen: len / 2 + 900,
+      halfWidth: wid / 2 + 140,
+    });
 
     // 跑道底座（把地形垫平）+ 停机坪底板
     const slab = this.box(wid + 46, slabH, len + 60, this._mats.concrete, x, slabTop - slabH / 2, z, { ry });
@@ -2630,7 +2654,6 @@ export class Landmarks {
     const minH = opts.minHeight || 34;
     const maxH = opts.maxHeight || 180;
     const baseY = opts.baseY !== undefined ? opts.baseY : this._heightAt(cx, cz);
-    this._reserve(cx, cz, radius + 40);
 
     const half = Math.max(1, Math.round(radius / cell));
     const streetGeos = [];
@@ -2706,6 +2729,9 @@ export class Landmarks {
           const ox = (rng() - 0.5) * (block - w - 8);
           const oz = (rng() - 0.5) * (block - d - 8);
           const style = (ix + iz + k + 8) % 4;
+          // 已登记为跑道/机场净空的区域不再放楼。这里必须逐个塔位检查，
+          // 因为城市半径可能和机场禁区重叠（Vetusta 就是机场紧邻城区）。
+          if (this._isReserved(bx + ox, bz + oz)) continue;
           this.buildTower(bx + ox, bz + oz, w, d, h, style, { baseY: y - 1.5, name: opts.towerName || 'Tower' });
           towerList.push({ x: bx + ox, z: bz + oz, w, d, h, top: y - 1.5 + h });
         }
@@ -2749,6 +2775,9 @@ export class Landmarks {
     }
     this._anchor('dropzones', 'city plaza', { x: cx, y: baseY + 4, z: cz }, 140);
     this._poi('City center', cx, baseY + 20, cz, 'city', radius * 0.9);
+    // 城区自己的禁区必须在塔楼/路灯/汽车都生成之后再登记：否则 _isReserved
+    // 会把本城区的每一栋楼、每一盏灯都当成“别人家的净空”而跳过。
+    this._reserve(cx, cz, radius + 40);
     return { x: cx, z: cz, baseY, radius, towers: towerList };
   }
 
@@ -2798,7 +2827,7 @@ export class Landmarks {
       const p = points[i];
       const px = Array.isArray(p) ? p[0] : p.x;
       const pz = Array.isArray(p) ? p[1] : p.z;
-      if (this._isWater(px, pz)) continue;
+      if (this._isWater(px, pz) || this._isReserved(px, pz)) continue;
       chosen.push({ x: px, z: pz, y: this._heightAt(px, pz) });
     }
     if (!chosen.length) return null;
@@ -2838,7 +2867,7 @@ export class Landmarks {
       const p = points[Math.floor(this._rng() * points.length)];
       const px = (Array.isArray(p) ? p[0] : p.x) + (this._rng() - 0.5) * spread;
       const pz = (Array.isArray(p) ? p[1] : p.z) + (this._rng() - 0.5) * spread;
-      if (this._isWater(px, pz)) continue;
+      if (this._isWater(px, pz) || this._isReserved(px, pz)) continue;
       this.setInstance(im, placed, px, this._heightAt(px, pz) + 0.1, pz, this._rng() * 6.28, 1,
         (this._rng() - 0.5) * 0.05, tints[i % tints.length]);
       placed++;
@@ -3821,9 +3850,39 @@ export class Landmarks {
     // 否则天空公园地面出生点会被悬岛的虚拟体积从地下弹走。
     const topY = y + size * 0.08;
     const bottomY = y - size * 0.16;
+    // 顶面只做“可降落平台”（oneWayTop），碰撞由下面的倒锥岩体负责。
+    // 旧实现只登记了这一块薄盒：从下方飞进岛体时，会先撞到岛顶薄盒的
+    // 底面（看不见的水平墙），而真正看得见的倒锥岩体完全没有碰撞。
     this.addBoxCollider('rock', x, (topY + bottomY) * 0.5, z, size * 0.92, (topY - bottomY) * 0.5, size * 0.92, {
       destructible: false, name: 'Sky island', object: g, surfaceY: topY, oneWayTop: true,
     });
+    // 倒锥岩体近似：分 4 层、每层两个 45° 交叠的盒子拼出接近圆形的截面。
+    // 只覆盖顶面以下的岩体，避免再叠出一个隐形平台；层高与视觉锥体一致。
+    const coneTop = bottomY;
+    const coneH = size * 1.34;
+    const layers = 4;
+    // 低空浮岛（如 Sky Park）的倒锥会插进地形；只给露出地面的那部分岩体
+    // 加碰撞，否则地面出生点会正好落在“看不见的地下岩体”里。
+    const groundY = this._heightAt(x, z);
+    for (let i = 0; i < layers; i++) {
+      const tm = (i + 0.5) / layers;
+      const r = Math.max(2, size * (1 - tm) * (1 - 0.25 * Math.sin(tm * 3.1)) * 0.75);
+      const cy = coneTop - tm * coneH;
+      const hy = coneH / (layers * 2);
+      // 与地形相交时把这一层的底切到地面上方，而不是整层丢弃：
+      // 高空的浮岛（Stratos）倒锥只露出几十米，整层丢弃会完全没有碰撞。
+      const layerTop = Math.min(cy + hy, coneTop);
+      const layerBottom = Math.max(cy - hy, groundY + 3);
+      if (layerTop - layerBottom < 2) continue;
+      const boxY = (layerTop + layerBottom) * 0.5;
+      const boxHy = (layerTop - layerBottom) * 0.5;
+      for (const rot of [0, Math.PI / 4]) {
+        this.addBoxCollider('rock', x, boxY, z, r, boxHy, r, {
+          destructible: false, name: 'Sky island rock', object: i === 0 ? g : null,
+          heading: rot, oriented: true, noPlatform: true,
+        });
+      }
+    }
     this._anchor('landingPads', opts.name || 'Sky island', { x, y: topY, z }, Math.max(14, size * 0.6));
     if (opts.poi !== false) this._poi(opts.name || 'Sky island', x, y + size * 0.3, z, 'island', size * 0.8);
     return g;
@@ -4159,53 +4218,83 @@ export class Landmarks {
     return pad;
   }
 
-  /** 高架路（固定高度 + 桥墩）。 */
+  /** 高架路（固定高度 + 桥墩）。经过跑道净空时自动断成桥段。 */
   buildElevatedRoad(pts, opts = {}) {
     const alt = opts.altitude !== undefined ? opts.altitude : this._heightAt(pts[0][0], pts[0][1]) + 18;
     const width = opts.width || 24;
-    const g = this.ribbonGeometry(pts, width, { altitude: alt, uvScale: 9, closed: !!opts.closed });
-    const deck = new THREE.Mesh(g, this._mats.asphalt);
-    deck.name = 'elevated_road';
-    this.root.add(deck);
-    this._stats.roads++;
-    // 桥墩 + 护栏
-    const pillars = [];
-    const rails = [];
-    const P = pts.map((p) => (Array.isArray(p) ? { x: p[0], z: p[1] } : p));
-    const segmentCount = opts.closed ? P.length : P.length - 1;
-    for (let i = 0; i < segmentCount; i++) {
-      const a = P[i];
-      const next = P[(i + 1) % P.length];
-      const dx = next.x - a.x, dz = next.z - a.z;
-      const dl = Math.hypot(dx, dz) || 1;
-      const nx = -dz / dl, nz = dx / dl;
-      const mx = (a.x + next.x) / 2, mz = (a.z + next.z) / 2;
-      const ground = this._heightAt(mx, mz);
-      const ph = Math.max(2, alt - ground);
-      pillars.push(new THREE.CylinderGeometry(2.6, 3.4, ph, 8).translate(mx, ground + ph / 2, mz));
-      const ang = Math.atan2(dx, dz);
-      for (const side of [-1, 1]) {
-        const rx = mx + nx * side * (width / 2 - 0.8), rz = mz + nz * side * (width / 2 - 0.8);
-        const rg = new THREE.BoxGeometry(0.5, 1.6, dl + 0.5);
-        rg.applyMatrix4(mat4(0, 0, 0, 0, ang, 0));
-        rg.translate(rx, alt + 1.4, rz);
-        rails.push(rg);
+    const P = pts.map((p) => (Array.isArray(p) ? { x: p[0], z: p[1] } : { x: p.x, z: p.z }));
+    if (P.length < 2) return null;
+    const closed = !!opts.closed;
+
+    // 按跑道净空切成若干连续桥段：整圈一条 ribbon 会直接横在起飞航线上，
+    // 飞机刚离地根本爬不过 48m 高架。断开后保留“城市高架”的观感，
+    // 同时给进近航线留出缺口。
+    const runs = [];
+    let cur = [];
+    const blocked = (p) => this._inRunwayClearance(p.x, p.z, width / 2 + 18);
+    for (let i = 0; i < P.length; i++) {
+      if (blocked(P[i])) {
+        if (cur.length >= 2) runs.push(cur);
+        cur = [];
+      } else {
+        cur.push(P[i]);
       }
     }
-    this.mergedMesh(pillars, this._mats.concreteDark, 'viaduct_pillars');
-    this.mergedMesh(rails, this._mats.paintWhite, 'viaduct_rails');
-    // 每个路段一个朝向正确的薄盒；旧版沿世界 Z 放置长 AABB，弯道处会漏碰撞。
-    for (let i = 0; i < segmentCount; i++) {
-      const a = P[i], b = P[(i + 1) % P.length];
-      const dx = b.x - a.x, dz = b.z - a.z;
-      const length = Math.hypot(dx, dz);
-      if (length < 1e-3) continue;
-      this.addBoxCollider('prop', (a.x + b.x) * 0.5, alt - 0.8, (a.z + b.z) * 0.5,
-        width / 2, 0.8, length / 2 + 0.75, {
-          destructible: false, name: 'Viaduct', heading: Math.atan2(dx, dz), oriented: true, surfaceY: alt,
-        });
+    if (closed) {
+      if (cur.length && runs.length && !blocked(P[0])) runs[0] = cur.concat(runs[0]);
+      else if (cur.length >= 2) runs.push(cur);
+    } else if (cur.length >= 2) {
+      runs.push(cur);
     }
-    return deck;
+    if (!runs.length) return null;
+
+    let firstDeck = null;
+    for (const run of runs) {
+      const isLoop = closed && run.length === P.length;
+      const deckGeo = this.ribbonGeometry(run, width, { altitude: alt, uvScale: 9, closed: isLoop });
+      const deck = new THREE.Mesh(deckGeo, this._mats.asphalt);
+      deck.name = 'elevated_road';
+      this.root.add(deck);
+      if (!firstDeck) firstDeck = deck;
+
+      const pillars = [];
+      const rails = [];
+      const segmentCount = isLoop ? run.length : run.length - 1;
+      for (let i = 0; i < segmentCount; i++) {
+        const a = run[i];
+        const next = run[(i + 1) % run.length];
+        const dx = next.x - a.x, dz = next.z - a.z;
+        const dl = Math.hypot(dx, dz) || 1;
+        const nx = -dz / dl, nz = dx / dl;
+        const mx = (a.x + next.x) / 2, mz = (a.z + next.z) / 2;
+        const ground = this._heightAt(mx, mz);
+        const ph = Math.max(2, alt - ground);
+        pillars.push(new THREE.CylinderGeometry(2.6, 3.4, ph, 8).translate(mx, ground + ph / 2, mz));
+        const ang = Math.atan2(dx, dz);
+        for (const side of [-1, 1]) {
+          const rx = mx + nx * side * (width / 2 - 0.8), rz = mz + nz * side * (width / 2 - 0.8);
+          const rg = new THREE.BoxGeometry(0.5, 1.6, dl + 0.5);
+          rg.applyMatrix4(mat4(0, 0, 0, 0, ang, 0));
+          rg.translate(rx, alt + 1.4, rz);
+          rails.push(rg);
+        }
+      }
+      if (pillars.length) this.mergedMesh(pillars, this._mats.concreteDark, 'viaduct_pillars');
+      if (rails.length) this.mergedMesh(rails, this._mats.paintWhite, 'viaduct_rails');
+      // 每个路段一个朝向正确的薄盒；旧版沿世界 Z 放置长 AABB，弯道处会漏碰撞。
+      for (let i = 0; i < segmentCount; i++) {
+        const a = run[i], b = run[(i + 1) % run.length];
+        const dx = b.x - a.x, dz = b.z - a.z;
+        const length = Math.hypot(dx, dz);
+        if (length < 1e-3) continue;
+        this.addBoxCollider('prop', (a.x + b.x) * 0.5, alt - 0.8, (a.z + b.z) * 0.5,
+          width / 2, 0.8, length / 2 + 0.75, {
+            destructible: false, name: 'Viaduct', heading: Math.atan2(dx, dz), oriented: true, surfaceY: alt,
+          });
+      }
+    }
+    this._stats.roads++;
+    return firstDeck;
   }
 
   /** 金字塔 + 方尖碑 + 遗迹柱。 */
@@ -6192,7 +6281,16 @@ export class Landmarks {
   /** 纯城市：密集高楼 + 高架路 + 体育场 + 楼顶直升机坪 + 霓虹。 */
   _kitVetusta() {
     const p = this._primary();
-    const cf = this._findFlatSpot(p.x, p.z, 1200, 620);
+    // 先建跑道，再建城市：Vetusta 的地形平整区本来就是按“能承载机场”选的，
+    // 但旧实现只在上面盖了城市，出生点是一块被高楼包围的空地。塔楼离地
+    // 350m 正好挡在起飞航路上（低画质密度还会生成另一套布局），飞机刚离地
+    // 就撞楼。跑道先建会登记净空走廊，城市随后自动绕开。
+    const strip = this._findFlatSpot(p.x, p.z, 400, 300);
+    this.buildAirport(strip.x, strip.z, p.heading, {
+      length: 860, width: 44, y: p.y, name: 'Vetusta Airfield', label: '18',
+      apron: 190, slabThickness: 5, taxiway: true,
+    });
+    const cf = this._findFlatSpot(p.x, p.z, 1600, 620, true);
     const city = this.buildCity(cf.x, cf.z, 900, {
       block: 112, street: 30, minHeight: 38, maxHeight: 188, towerName: 'Vetusta Tower',
     });
@@ -6206,7 +6304,9 @@ export class Landmarks {
     }
     this.buildElevatedRoad(vp, { altitude: city.baseY + 24, width: 26, closed: true });
     // 体育场
-    const sf = this._findFlatSpot(cf.x - 900, cf.z + 800, 900, 220);
+    // 体育场占地 280×220m，选址也必须避开机场净空，否则会像旧版那样
+    // 直接横在跑道尽头（Vetusta 的出生点就在跑道中心）。
+    const sf = this._findFlatSpot(cf.x - 900, cf.z + 800, 900, 220, true);
     this.buildStadium(sf.x, sf.z, { radius: 140, y: sf.y });
     // 楼顶直升机坪（最高的几栋）
     const towers = (city.towers || []).slice().sort((a, b) => b.h - a.h).slice(0, 6);
